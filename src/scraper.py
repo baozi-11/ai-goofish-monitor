@@ -81,6 +81,14 @@ EDGE_DOCKER_WARNING_PRINTED = False
 INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
 INITIAL_SEARCH_RESPONSE_RETRY_COUNT = 2
 INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 def _is_login_url(url: str) -> bool:
@@ -139,6 +147,13 @@ def _resolve_browser_channel() -> str:
             EDGE_DOCKER_WARNING_PRINTED = True
         return "chromium"
     return "msedge" if LOGIN_IS_EDGE else "chrome"
+
+
+def _build_browser_env_without_global_proxy() -> dict:
+    browser_env = dict(os.environ)
+    for key in PROXY_ENV_KEYS:
+        browser_env.pop(key, None)
+    return browser_env
 
 
 def _should_analyze_images(task_config: dict) -> bool:
@@ -698,7 +713,11 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 "--disable-features=IsolateOrigins,site-per-process",
             ]
 
-            launch_kwargs = {"headless": RUN_HEADLESS, "args": launch_args}
+            launch_kwargs = {
+                "headless": RUN_HEADLESS,
+                "args": launch_args,
+                "env": _build_browser_env_without_global_proxy(),
+            }
             if proxy_server:
                 launch_kwargs["proxy"] = {"server": proxy_server}
 
