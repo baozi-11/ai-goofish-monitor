@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG BASE_IMAGE=ghcr.io/usagi-org/ai-goofish-base:latest
+ARG BASE_IMAGE=ghcr.io/baozi-11/ai-goofish-base:latest
 
 FROM node:22-alpine AS frontend-builder
 
