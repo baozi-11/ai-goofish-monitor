@@ -78,6 +78,9 @@ class LoginRequiredError(Exception):
 
 FAILURE_GUARD = FailureGuard()
 EDGE_DOCKER_WARNING_PRINTED = False
+INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
+INITIAL_SEARCH_RESPONSE_RETRY_COUNT = 2
+INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
 
 
 def _is_login_url(url: str) -> bool:
@@ -85,6 +88,44 @@ def _is_login_url(url: str) -> bool:
         return False
     lowered = url.lower()
     return "passport.goofish.com" in lowered or "mini_login" in lowered
+
+
+async def _is_locator_visible(locator, timeout_ms: int) -> bool:
+    try:
+        await locator.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
+async def _raise_if_security_challenge(page, keyword: str, timeout_ms: int = 2000) -> None:
+    baxia_dialog = page.locator("div.baxia-dialog-mask")
+    if await _is_locator_visible(baxia_dialog, timeout_ms):
+        print("\n==================== CRITICAL BLOCK DETECTED ====================")
+        print("检测到闲鱼反爬虫验证弹窗 (baxia-dialog)，无法继续操作。")
+        print("这通常是因为操作过于频繁或被识别为机器人。")
+        print("建议：")
+        print("1. 停止脚本一段时间再试。")
+        print(
+            "2. (推荐) 在 .env 文件中设置 RUN_HEADLESS=false，"
+            "以非无头模式运行，这有助于绕过检测。"
+        )
+        print(f"任务 '{keyword}' 将在此处中止。")
+        print("===================================================================")
+        raise RiskControlError("baxia-dialog")
+
+    middleware_widget = page.locator("div.J_MIDDLEWARE_FRAME_WIDGET")
+    if await _is_locator_visible(middleware_widget, timeout_ms):
+        print("\n==================== CRITICAL BLOCK DETECTED ====================")
+        print("检测到闲鱼反爬虫验证弹窗 (J_MIDDLEWARE_FRAME_WIDGET)，无法继续操作。")
+        print("这通常是因为操作过于频繁或被识别为机器人。")
+        print("建议：")
+        print("1. 停止脚本一段时间再试。")
+        print("2. (推荐) 更新登录状态文件，确保登录状态有效。")
+        print("3. 降低任务执行频率，避免被识别为机器人。")
+        print(f"任务 '{keyword}' 将在此处中止。")
+        print("===================================================================")
+        raise RiskControlError("J_MIDDLEWARE_FRAME_WIDGET")
 
 
 def _resolve_browser_channel() -> str:
@@ -749,20 +790,45 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 search_url = f"https://www.goofish.com/search?{urlencode(params)}"
                 log_time(f"目标URL: {search_url}")
 
-                # 先监听搜索接口响应，再执行导航，避免错过首次请求
-                async with page.expect_response(
-                    is_search_results_response, timeout=30000
-                ) as initial_response_info:
-                    await page.goto(
-                        search_url, wait_until="domcontentloaded", timeout=60000
-                    )
-                if _is_login_url(page.url):
-                    raise LoginRequiredError(
-                        f"Login required: redirected to {page.url} (cookies/state likely expired)"
-                    )
+                initial_response = None
+                for retry_index in range(INITIAL_SEARCH_RESPONSE_RETRY_COUNT):
+                    try:
+                        # 先监听搜索接口响应，再执行导航，避免错过首次请求
+                        async with page.expect_response(
+                            is_search_results_response,
+                            timeout=INITIAL_SEARCH_RESPONSE_TIMEOUT_MS,
+                        ) as initial_response_info:
+                            await page.goto(
+                                search_url,
+                                wait_until="domcontentloaded",
+                                timeout=60000,
+                            )
+                        if _is_login_url(page.url):
+                            raise LoginRequiredError(
+                                f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                            )
 
-                # 捕获初始搜索的API数据
-                initial_response = await initial_response_info.value
+                        # 捕获初始搜索的API数据
+                        initial_response = await initial_response_info.value
+                        break
+                    except PlaywrightTimeoutError:
+                        if _is_login_url(page.url):
+                            raise LoginRequiredError(
+                                f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                            )
+                        await _raise_if_security_challenge(page, keyword, timeout_ms=1000)
+                        if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
+                            log_time(
+                                "等待初始搜索响应超时，"
+                                f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
+                            )
+                            await asyncio.sleep(INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS)
+                            continue
+                        log_time(
+                            "等待初始搜索响应超时，本轮任务跳过，"
+                            "不计为失败保护。"
+                        )
+                        return 0
 
                 # 等待页面加载出关键筛选元素，以确认已成功进入搜索结果页
                 try:
