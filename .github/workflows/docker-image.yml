@@ -1,42 +1,53 @@
-name: Build and Push Docker Image
+name: Docker Image CI
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: ["master", "main"]
 
 permissions:
   contents: read
   packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: baozi-11/ai-goofish
+  IMAGE_NAME: ai-goofish
+  GHCR_IMAGE: ghcr.io/baozi-11/ai-goofish
+  ALIYUN_IMAGE: crpi-59swusuntfg1kose.cn-shanghai.personal.cr.aliyuncs.com/baozi-localhost/ai-goofish-monitor
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: crpi-59swusuntfg1kose.cn-shanghai.personal.cr.aliyuncs.com
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          platforms: linux/amd64
+          tags: |
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ github.sha }}
+            ${{ env.ALIYUN_IMAGE }}:latest
+            ${{ env.ALIYUN_IMAGE }}:${{ github.sha }}
