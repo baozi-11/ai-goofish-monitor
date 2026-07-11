@@ -4,6 +4,8 @@ Bark 通知客户端
 import asyncio
 import requests
 from typing import Dict
+from urllib.parse import quote
+
 from .base import NotificationClient
 
 
@@ -23,26 +25,32 @@ class BarkClient(NotificationClient):
             raise RuntimeError("Bark 未启用")
 
         message = self._build_message(product_data, reason)
-        bark_payload = {
-            "title": message.notification_title,
-            "body": message.content,
-            "url": message.mobile_link or message.desktop_link,
+        content_lines = [
+            message.notification_title,
+            "",
+            f"价格: {message.price}",
+            f"原因: {message.reason}",
+        ]
+        if message.mobile_link:
+            content_lines.append(f"手机端链接: {message.mobile_link}")
+
+        bark_message = "\n".join(content_lines)
+        bark_url = f"{self.bark_url.rstrip('/')}/{quote(bark_message, safe='')}"
+        bark_params = {
             "level": "timeSensitive",
-            "group": "闲鱼监控"
+            "group": "闲鱼监控",
         }
 
         if message.image_url:
-            bark_payload["icon"] = message.image_url
+            bark_params["image"] = message.image_url
 
-        headers = {"Content-Type": "application/json; charset=utf-8"}
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: requests.post(
-                self.bark_url,
-                json=bark_payload,
-                headers=headers,
-                timeout=10
+            lambda: requests.get(
+                bark_url,
+                params=bark_params,
+                timeout=10,
             )
         )
         response.raise_for_status()

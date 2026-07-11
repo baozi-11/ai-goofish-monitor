@@ -49,6 +49,45 @@ def _normalize_keyword_values(value) -> List[str]:
     return normalized
 
 
+def _normalize_keyword_alert_rules(value) -> List[dict]:
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        raw_values = re.split(r"[\n,]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        raw_values = [value]
+
+    normalized: List[dict] = []
+    seen = set()
+    for item in raw_values:
+        if isinstance(item, dict):
+            keyword = str(item.get("keyword") or "").strip()
+            max_price = _normalize_price_value(item.get("max_price"))
+        elif hasattr(item, "keyword"):
+            keyword = str(getattr(item, "keyword", "") or "").strip()
+            max_price = _normalize_price_value(getattr(item, "max_price", None))
+        else:
+            keyword = str(item or "").strip()
+            max_price = None
+        if not keyword:
+            continue
+        dedup_key = keyword.lower()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        normalized.append({"keyword": keyword, "max_price": max_price})
+    return normalized
+
+
+def _keyword_rules_from_alert_rules(value) -> List[str]:
+    return _normalize_keyword_values(
+        [rule.get("keyword") for rule in _normalize_keyword_alert_rules(value)]
+    )
+
+
 def _extract_keywords_from_legacy_groups(groups) -> List[str]:
     if not groups:
         return []
@@ -73,17 +112,34 @@ def _normalize_payload_keywords(payload: Any) -> Any:
         values.get("account_strategy"),
         values.get("account_state_file"),
     )
+    if "keyword_alert_rules" in values:
+        values["keyword_alert_rules"] = _normalize_keyword_alert_rules(
+            values.get("keyword_alert_rules")
+        )
     if "keyword_rules" in values:
         values["keyword_rules"] = _normalize_keyword_values(values.get("keyword_rules"))
     elif "keyword_rule_groups" in values:
         values["keyword_rules"] = _extract_keywords_from_legacy_groups(
             values.get("keyword_rule_groups")
         )
+    if not values.get("keyword_alert_rules") and values.get("keyword_rules"):
+        values["keyword_alert_rules"] = [
+            {"keyword": keyword, "max_price": None}
+            for keyword in values.get("keyword_rules") or []
+        ]
+    if values.get("keyword_alert_rules") and not values.get("keyword_rules"):
+        values["keyword_rules"] = _keyword_rules_from_alert_rules(
+            values.get("keyword_alert_rules")
+        )
     return values
 
 
 def _has_keyword_rules(keyword_rules: List[str]) -> bool:
     return bool(keyword_rules and len(keyword_rules) > 0)
+
+
+def _has_keyword_alert_rules(keyword_alert_rules: List[Any]) -> bool:
+    return bool(_normalize_keyword_alert_rules(keyword_alert_rules))
 
 
 def _normalize_optional_string(value):
@@ -102,6 +158,23 @@ def _normalize_price_value(value):
     if isinstance(value, (int, float)):
         return str(value)
     return value
+
+
+class KeywordAlertRule(BaseModel):
+    """关键词价格提醒规则。"""
+
+    keyword: str
+    max_price: Optional[str] = None
+
+    @field_validator("keyword", mode="before")
+    @classmethod
+    def normalize_keyword(cls, value):
+        return str(value or "").strip()
+
+    @field_validator("max_price", mode="before")
+    @classmethod
+    def normalize_max_price(cls, value):
+        return _normalize_price_value(value)
 
 
 class Task(BaseModel):
@@ -129,6 +202,7 @@ class Task(BaseModel):
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
+    keyword_alert_rules: List[KeywordAlertRule] = Field(default_factory=list)
     is_running: bool = False
 
     @model_validator(mode="before")
@@ -141,6 +215,11 @@ class Task(BaseModel):
     def normalize_keyword_rules(cls, value):
         return _normalize_keyword_values(value)
 
+    @field_validator("keyword_alert_rules", mode="before")
+    @classmethod
+    def normalize_keyword_alert_rules(cls, value):
+        return _normalize_keyword_alert_rules(value)
+
     def can_start(self) -> bool:
         """检查任务是否可以启动"""
         return self.enabled and not self.is_running
@@ -152,7 +231,9 @@ class Task(BaseModel):
     def apply_update(self, update: "TaskUpdate") -> "Task":
         """应用更新并返回新的任务实例"""
         update_data = update.model_dump(exclude_unset=True)
-        return self.model_copy(update=update_data)
+        merged = self.model_dump()
+        merged.update(update_data)
+        return Task(**merged)
 
 
 class TaskCreate(BaseModel):
@@ -179,6 +260,7 @@ class TaskCreate(BaseModel):
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
+    keyword_alert_rules: List[KeywordAlertRule] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -210,12 +292,20 @@ class TaskCreate(BaseModel):
     def normalize_keyword_rules(cls, value):
         return _normalize_keyword_values(value)
 
+    @field_validator("keyword_alert_rules", mode="before")
+    @classmethod
+    def normalize_keyword_alert_rules(cls, value):
+        return _normalize_keyword_alert_rules(value)
+
     @model_validator(mode="after")
     def validate_decision_mode_payload(self):
         description = str(self.description or "").strip()
         if self.decision_mode == "ai" and not description:
             raise ValueError("AI 判断模式下，详细需求(description)不能为空。")
-        if self.decision_mode == "keyword" and not _has_keyword_rules(self.keyword_rules):
+        if self.decision_mode == "keyword" and not (
+            _has_keyword_rules(self.keyword_rules)
+            or _has_keyword_alert_rules(self.keyword_alert_rules)
+        ):
             raise ValueError("关键词判断模式下，至少需要一个关键词。")
         if self.account_strategy == "fixed" and not self.account_state_file:
             raise ValueError("固定账号模式下必须选择账号。")
@@ -246,6 +336,7 @@ class TaskUpdate(BaseModel):
     region: Optional[str] = None
     decision_mode: Optional[Literal["ai", "keyword"]] = None
     keyword_rules: Optional[List[str]] = None
+    keyword_alert_rules: Optional[List[KeywordAlertRule]] = None
     is_running: Optional[bool] = None
 
     @model_validator(mode="before")
@@ -278,10 +369,20 @@ class TaskUpdate(BaseModel):
     def normalize_keyword_rules(cls, value):
         return _normalize_keyword_values(value)
 
+    @field_validator("keyword_alert_rules", mode="before")
+    @classmethod
+    def normalize_keyword_alert_rules(cls, value):
+        return _normalize_keyword_alert_rules(value)
+
     @model_validator(mode="after")
     def validate_partial_keyword_payload(self):
-        if self.decision_mode == "keyword" and self.keyword_rules is not None:
-            if not _has_keyword_rules(self.keyword_rules):
+        if self.decision_mode == "keyword" and (
+            self.keyword_rules is not None or self.keyword_alert_rules is not None
+        ):
+            if not (
+                _has_keyword_rules(self.keyword_rules or [])
+                or _has_keyword_alert_rules(self.keyword_alert_rules or [])
+            ):
                 raise ValueError("关键词判断模式下，至少需要一个关键词。")
         if self.decision_mode == "ai" and self.description is not None:
             if not str(self.description).strip():
@@ -310,6 +411,7 @@ class TaskGenerateRequest(BaseModel):
     region: Optional[str] = None
     decision_mode: Literal["ai", "keyword"] = "ai"
     keyword_rules: List[str] = Field(default_factory=list)
+    keyword_alert_rules: List[KeywordAlertRule] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -346,12 +448,20 @@ class TaskGenerateRequest(BaseModel):
     def normalize_keyword_rules(cls, value):
         return _normalize_keyword_values(value)
 
+    @field_validator("keyword_alert_rules", mode="before")
+    @classmethod
+    def normalize_keyword_alert_rules(cls, value):
+        return _normalize_keyword_alert_rules(value)
+
     @model_validator(mode="after")
     def validate_decision_mode_payload(self):
         description = str(self.description or "").strip()
         if self.decision_mode == "ai" and not description:
             raise ValueError("AI 判断模式下，详细需求(description)不能为空。")
-        if self.decision_mode == "keyword" and not _has_keyword_rules(self.keyword_rules):
+        if self.decision_mode == "keyword" and not (
+            _has_keyword_rules(self.keyword_rules)
+            or _has_keyword_alert_rules(self.keyword_alert_rules)
+        ):
             raise ValueError("关键词判断模式下，至少需要一个关键词。")
         if self.account_strategy == "fixed" and not self.account_state_file:
             raise ValueError("固定账号模式下必须选择账号。")

@@ -22,7 +22,13 @@ export interface Task {
   region?: string | null;
   decision_mode: 'ai' | 'keyword';
   keyword_rules: string[];
+  keyword_alert_rules: KeywordAlertRule[];
   is_running: boolean;
+}
+
+export interface KeywordAlertRule {
+  keyword: string;
+  max_price?: string | null;
 }
 
 export type TaskGenerationStatus = 'queued' | 'running' | 'completed' | 'failed';
@@ -73,4 +79,5 @@ export interface TaskGenerateRequest {
   region?: string | null;
   decision_mode?: 'ai' | 'keyword';
   keyword_rules?: string[];
+  keyword_alert_rules?: KeywordAlertRule[];
 }

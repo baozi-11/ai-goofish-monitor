@@ -8,7 +8,11 @@ import os
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-from src.keyword_rule_engine import build_search_text, evaluate_keyword_rules
+from src.keyword_rule_engine import (
+    build_search_text,
+    evaluate_keyword_alert_rules,
+    evaluate_keyword_rules,
+)
 
 
 SellerLoader = Callable[[str], Awaitable[dict]]
@@ -30,6 +34,7 @@ class ItemAnalysisJob:
     seller_id: Optional[str]
     zhima_credit_text: Optional[str]
     registration_duration_text: str
+    keyword_alert_rules: tuple[dict, ...] = ()
 
 
 class ItemAnalysisDispatcher:
@@ -54,6 +59,7 @@ class ItemAnalysisDispatcher:
         self._notifier = notifier
         self._saver = saver
         self._tasks: set[asyncio.Task] = set()
+        self._notification_tasks: set[asyncio.Task] = set()
         self.completed_count = 0
 
     def submit(self, job: ItemAnalysisJob) -> None:
@@ -64,6 +70,20 @@ class ItemAnalysisDispatcher:
     async def join(self) -> None:
         while self._tasks:
             await asyncio.gather(*tuple(self._tasks))
+        await self.drain_notifications(timeout=2.0)
+
+    async def drain_notifications(self, *, timeout: float = 2.0) -> None:
+        if not self._notification_tasks:
+            return
+        _, pending = await asyncio.wait(
+            tuple(self._notification_tasks),
+            timeout=timeout,
+        )
+        if pending:
+            print(
+                f"   [通知] 仍有 {len(pending)} 个后台通知任务未完成，"
+                "不阻塞本轮抓取结束。"
+            )
 
     async def _process_with_limit(self, job: ItemAnalysisJob) -> None:
         async with self._semaphore:
@@ -76,16 +96,10 @@ class ItemAnalysisDispatcher:
         record["ai_analysis"] = await self._build_analysis_result(job, record)
         if await self._saver(record, job.keyword):
             self.completed_count += 1
-        await self._notify_if_recommended(item_data, record["ai_analysis"])
+            self._notify_if_recommended(item_data, record["ai_analysis"])
 
     async def _load_seller_info(self, job: ItemAnalysisJob) -> dict:
-        seller_info = {}
-        if job.seller_id:
-            try:
-                seller_info = await self._seller_loader(job.seller_id)
-            except Exception as exc:
-                print(f"   [卖家] 采集卖家 {job.seller_id} 信息失败: {exc}")
-        merged = copy.deepcopy(seller_info or {})
+        merged = {}
         merged["卖家芝麻信用"] = job.zhima_credit_text
         merged["卖家注册时长"] = job.registration_duration_text
         return merged
@@ -99,6 +113,13 @@ class ItemAnalysisDispatcher:
 
     def _build_keyword_result(self, job: ItemAnalysisJob, record: dict) -> dict:
         search_text = build_search_text(record)
+        if job.keyword_alert_rules:
+            item_data = record.get("商品信息", {}) or {}
+            return evaluate_keyword_alert_rules(
+                list(job.keyword_alert_rules),
+                search_text,
+                item_data.get("当前售价"),
+            )
         return evaluate_keyword_rules(list(job.keyword_rules), search_text)
 
     def _build_skip_ai_result(self) -> dict:
@@ -164,10 +185,18 @@ class ItemAnalysisDispatcher:
             except Exception as exc:
                 print(f"   [图片] 删除图片文件时出错: {exc}")
 
-    async def _notify_if_recommended(self, item_data: dict, analysis_result: dict) -> None:
+    def _notify_if_recommended(self, item_data: dict, analysis_result: dict) -> None:
         if not analysis_result.get("is_recommended"):
             return
+        reason = analysis_result.get("reason", "无")
+        task = asyncio.create_task(
+            self._send_notification(copy.deepcopy(item_data), reason)
+        )
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_tasks.discard)
+
+    async def _send_notification(self, item_data: dict, reason: str) -> None:
         try:
-            await self._notifier(item_data, analysis_result.get("reason", "无"))
+            await self._notifier(item_data, reason)
         except Exception as exc:
-            print(f"   [通知] 发送推荐通知失败: {exc}")
+            print(f"   [通知] 后台发送失败: {exc}")

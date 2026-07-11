@@ -96,6 +96,14 @@ class _FileLock:
             import fcntl
 
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            return self
+        except Exception:
+            pass
+        try:
+            import msvcrt
+
+            self._fh.seek(0)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
         except Exception:
             pass
         return self
@@ -105,6 +113,14 @@ class _FileLock:
             import fcntl
 
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            return False
+        except Exception:
+            pass
+        try:
+            import msvcrt
+
+            self._fh.seek(0)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
         except Exception:
             pass
         return False
@@ -188,9 +204,9 @@ class FailureGuard:
 
     def _update_task(self, task_key: str, updater) -> dict:
         _ensure_parent_dir(self.path)
-        with open(self.path, "a+", encoding="utf-8") as fh:
+        lock_path = f"{self.path}.lock"
+        with open(lock_path, "a+", encoding="utf-8") as fh:
             with _FileLock(fh):
-                fh.seek(0)
                 data = self._load()
                 tasks = data.setdefault("tasks", {})
                 entry = tasks.get(task_key) or {}

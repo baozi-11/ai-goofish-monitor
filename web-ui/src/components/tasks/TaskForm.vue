@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { Task, TaskGenerateRequest } from '@/types/task.d.ts'
+import { Plus, Trash2 } from 'lucide-vue-next'
+import type { KeywordAlertRule, Task, TaskGenerateRequest } from '@/types/task.d.ts'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { toast } from '@/components/ui/toast'
+import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import TaskRegionSelector from '@/components/tasks/TaskRegionSelector.vue'
@@ -32,7 +34,7 @@ const { t } = useI18n()
 const form = ref<any>({})
 const accountStrategy = ref<'auto' | 'fixed' | 'rotate'>('auto')
 const selectedAccountStateFile = ref(AUTO_ACCOUNT_VALUE)
-const keywordRulesInput = ref('')
+const keywordAlertRules = ref<{ keyword: string; max_price: string }[]>([])
 const cronMode = ref<'preset' | 'custom'>('preset')
 
 // 常用 cron 预设选项
@@ -76,21 +78,55 @@ const accountStrategyOptions = computed(() => [
   { value: 'rotate', label: t('tasks.form.accountStrategy.rotate'), description: t('tasks.form.accountStrategy.rotateDescription') },
 ])
 
-function parseKeywordText(text: string): string[] {
-  const values = String(text || '')
-    .split(/[\n,]+/)
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0)
+function buildKeywordAlertRuleDrafts(value: any, fallbackKeywords: string[] = []) {
+  const rawRules = Array.isArray(value) ? value : []
+  const source = rawRules.length > 0
+    ? rawRules
+    : fallbackKeywords.map((keyword) => ({ keyword, max_price: '' }))
 
   const seen = new Set<string>()
-  const deduped: string[] = []
-  for (const value of values) {
-    const key = value.toLowerCase()
+  const drafts: { keyword: string; max_price: string }[] = []
+  for (const item of source) {
+    const keyword = String(typeof item === 'string' ? item : item?.keyword || '').trim()
+    if (!keyword) continue
+    const key = keyword.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
-    deduped.push(value)
+    drafts.push({
+      keyword,
+      max_price: item?.max_price == null ? '' : String(item.max_price),
+    })
   }
-  return deduped
+  return drafts.length > 0 ? drafts : [{ keyword: '', max_price: '' }]
+}
+
+function serializeKeywordAlertRules(): KeywordAlertRule[] {
+  const seen = new Set<string>()
+  const rules: KeywordAlertRule[] = []
+  for (const item of keywordAlertRules.value) {
+    const keyword = String(item.keyword || '').trim()
+    if (!keyword) continue
+    const key = keyword.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    const maxPrice = String(item.max_price || '').trim()
+    rules.push({
+      keyword,
+      max_price: maxPrice ? maxPrice : null,
+    })
+  }
+  return rules
+}
+
+function addKeywordAlertRule() {
+  keywordAlertRules.value.push({ keyword: '', max_price: '' })
+}
+
+function removeKeywordAlertRule(index: number) {
+  keywordAlertRules.value.splice(index, 1)
+  if (keywordAlertRules.value.length === 0) {
+    addKeywordAlertRule()
+  }
 }
 
 watch(() => [props.mode, props.initialData, props.defaultValues, props.defaultAccount], () => {
@@ -114,7 +150,10 @@ watch(() => [props.mode, props.initialData, props.defaultValues, props.defaultAc
       region: defaultValues.region || props.initialData.region || '',
       decision_mode: defaultValues.decision_mode || props.initialData.decision_mode || 'ai',
     }
-    keywordRulesInput.value = (defaultValues.keyword_rules || props.initialData.keyword_rules || []).join('\n')
+    keywordAlertRules.value = buildKeywordAlertRuleDrafts(
+      defaultValues.keyword_alert_rules || props.initialData.keyword_alert_rules,
+      defaultValues.keyword_rules || props.initialData.keyword_rules || [],
+    )
     // 编辑模式下，根据 cron 值判断模式
     const cronVal = defaultValues.cron ?? props.initialData.cron ?? ''
     cronMode.value = isPresetCronValue(cronVal) ? 'preset' : 'custom'
@@ -146,10 +185,10 @@ watch(() => [props.mode, props.initialData, props.defaultValues, props.defaultAc
     if (!form.value.new_publish_option) {
       form.value.new_publish_option = '__none__'
     }
-    keywordRulesInput.value = ''
-    if (defaultValues.keyword_rules && defaultValues.keyword_rules.length > 0) {
-      keywordRulesInput.value = defaultValues.keyword_rules.join('\n')
-    }
+    keywordAlertRules.value = buildKeywordAlertRuleDrafts(
+      defaultValues.keyword_alert_rules,
+      defaultValues.keyword_rules || [],
+    )
     // 创建模式下，根据默认值判断模式
     const cronVal = defaultValues.cron ?? ''
     cronMode.value = isPresetCronValue(cronVal) ? 'preset' : 'custom'
@@ -203,8 +242,9 @@ function handleSubmit() {
     return
   }
 
-  const keywordRules = parseKeywordText(keywordRulesInput.value)
-  if (decisionMode === 'keyword' && keywordRules.length === 0) {
+  const keywordAlertRulePayload = serializeKeywordAlertRules()
+  const keywordRules = keywordAlertRulePayload.map((rule) => rule.keyword)
+  if (decisionMode === 'keyword' && keywordAlertRulePayload.length === 0) {
     toast({
       title: t('tasks.form.validation.keywordRuleIncomplete'),
       description: t('tasks.form.validation.keywordRuleRequired'),
@@ -249,6 +289,7 @@ function handleSubmit() {
   submitData.account_strategy = currentAccountStrategy
   submitData.analyze_images = submitData.analyze_images !== false
   submitData.keyword_rules = decisionMode === 'keyword' ? keywordRules : []
+  submitData.keyword_alert_rules = decisionMode === 'keyword' ? keywordAlertRulePayload : []
   if (decisionMode === 'keyword' && !submitData.description) {
     submitData.description = ''
   }
@@ -311,11 +352,40 @@ function handleSubmit() {
           <p class="text-xs text-gray-500">
             {{ t('tasks.form.keywordRulesHint') }}
           </p>
-          <Textarea
-            v-model="keywordRulesInput"
-            class="min-h-[120px]"
-            :placeholder="t('tasks.form.keywordRulesPlaceholder')"
-          />
+          <div class="space-y-2">
+            <div
+              v-for="(rule, index) in keywordAlertRules"
+              :key="index"
+              class="grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_auto] items-center gap-2"
+            >
+              <Input
+                v-model="rule.keyword"
+                :aria-label="t('tasks.form.keywordRuleKeyword')"
+                :placeholder="t('tasks.form.keywordRulesPlaceholder')"
+              />
+              <Input
+                v-model="rule.max_price"
+                type="number"
+                min="0"
+                :aria-label="t('tasks.form.keywordRuleMaxPrice')"
+                :placeholder="t('tasks.form.keywordRuleMaxPrice')"
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                :aria-label="t('tasks.form.removeKeywordRule')"
+                :title="t('tasks.form.removeKeywordRule')"
+                @click="removeKeywordAlertRule(index)"
+              >
+                <Trash2 class="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+          <Button type="button" variant="outline" size="sm" @click="addKeywordAlertRule">
+            <Plus class="mr-1 h-4 w-4" />
+            {{ t('tasks.form.addKeywordRule') }}
+          </Button>
         </div>
       </div>
 

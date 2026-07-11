@@ -39,6 +39,17 @@ const props = defineProps<Props>()
 const { t } = useI18n()
 const isStopping = (id: number) => props.stoppingIds?.has(id) ?? false
 const isKeywordMode = (task: Task) => task.decision_mode === 'keyword'
+const resolveKeywordRuleCount = (task: Task) => (
+  task.keyword_alert_rules?.length || task.keyword_rules?.length || 0
+)
+const resolveKeywordRuleSummary = (task: Task) => {
+  const rules = task.keyword_alert_rules?.length
+    ? task.keyword_alert_rules
+    : (task.keyword_rules || []).map((keyword) => ({ keyword, max_price: null }))
+  return rules
+    .map((rule) => rule.max_price ? `${rule.keyword} ≤ ${rule.max_price}` : rule.keyword)
+    .join(' / ')
+}
 const nowMs = ref(Date.now())
 let timer: number | null = null
 
@@ -214,8 +225,12 @@ const emit = defineEmits<{
                   </p>
                 </div>
 
-                <div v-if="isKeywordMode(task)" class="rounded-lg border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700">
-                  {{ t('tasks.table.keywordStrategies', { count: task.keyword_rules?.length || 0 }) }}
+                <div
+                  v-if="isKeywordMode(task)"
+                  class="rounded-lg border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"
+                  :title="resolveKeywordRuleSummary(task)"
+                >
+                  {{ t('tasks.table.keywordStrategies', { count: resolveKeywordRuleCount(task) }) }}
                 </div>
                 <div v-else class="flex flex-wrap items-center gap-2">
                   <div class="rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs font-mono font-semibold text-emerald-700">
@@ -404,8 +419,12 @@ const emit = defineEmits<{
             <!-- Column 4: AI/Keyword Mode Details -->
             <TableCell class="align-middle text-center">
               <div class="inline-flex flex-col items-center gap-2">
-                <div v-if="isKeywordMode(task)" class="bg-blue-50/30 p-2 rounded-xl border border-blue-100/50">
-                  <div class="text-xs font-black text-blue-600">{{ t('tasks.table.keywordStrategies', { count: task.keyword_rules?.length || 0 }) }}</div>
+                <div
+                  v-if="isKeywordMode(task)"
+                  class="bg-blue-50/30 p-2 rounded-xl border border-blue-100/50"
+                  :title="resolveKeywordRuleSummary(task)"
+                >
+                  <div class="text-xs font-black text-blue-600">{{ t('tasks.table.keywordStrategies', { count: resolveKeywordRuleCount(task) }) }}</div>
                   <div class="text-[9px] font-bold text-blue-400/70 uppercase mt-0.5 tracking-tighter">OR Logic</div>
                 </div>
                 <div v-else class="flex flex-col items-center gap-1.5">

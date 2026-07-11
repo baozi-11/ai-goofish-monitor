@@ -4,6 +4,7 @@ from src.services.price_history_service import (
     load_price_snapshots,
     record_market_snapshots,
 )
+from src.scraper import _notify_duplicate_price_drop_if_needed
 
 
 def test_record_market_snapshots_and_build_price_history_insights(tmp_path, monkeypatch):
@@ -97,3 +98,72 @@ def test_record_market_snapshots_and_build_price_history_insights(tmp_path, monk
     assert item_context["max_price"] == 10000.0
     assert item_context["price_change_amount"] == -500.0
     assert item_context["deal_label"] == "高性价比"
+
+
+def test_duplicate_price_drop_notification(monkeypatch):
+    notifications = []
+
+    async def fake_notify(item_data, reason):
+        notifications.append((item_data, reason))
+        return {}
+
+    monkeypatch.setattr("src.scraper.send_ntfy_notification", fake_notify)
+    previous_snapshots = [
+        {
+            "item_id": "1001",
+            "link": "https://www.goofish.com/item?id=1001",
+            "price": 10000,
+        }
+    ]
+    item = {
+        "商品ID": "1001",
+        "商品标题": "Sony A7M4 单机",
+        "当前售价": "¥9500",
+        "商品链接": "https://www.goofish.com/item?id=1001",
+    }
+
+    import asyncio
+
+    notified = asyncio.run(
+        _notify_duplicate_price_drop_if_needed(
+            item_data=item,
+            previous_snapshots=previous_snapshots,
+            keyword_rules=["a7m4"],
+            keyword_alert_rules=[],
+            decision_mode="keyword",
+        )
+    )
+
+    assert notified is True
+    assert len(notifications) == 1
+    assert "重复商品降价" in notifications[0][1]
+
+
+def test_duplicate_price_drop_notification_skips_non_drop(monkeypatch):
+    notifications = []
+
+    async def fake_notify(item_data, reason):
+        notifications.append((item_data, reason))
+        return {}
+
+    monkeypatch.setattr("src.scraper.send_ntfy_notification", fake_notify)
+
+    import asyncio
+
+    notified = asyncio.run(
+        _notify_duplicate_price_drop_if_needed(
+            item_data={
+                "商品ID": "1001",
+                "商品标题": "Sony A7M4 单机",
+                "当前售价": "¥10000",
+                "商品链接": "https://www.goofish.com/item?id=1001",
+            },
+            previous_snapshots=[{"item_id": "1001", "price": 9500}],
+            keyword_rules=["a7m4"],
+            keyword_alert_rules=[],
+            decision_mode="keyword",
+        )
+    )
+
+    assert notified is False
+    assert notifications == []

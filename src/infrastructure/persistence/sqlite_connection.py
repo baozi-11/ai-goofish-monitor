@@ -43,6 +43,7 @@ SCHEMA_STATEMENTS = (
         region TEXT,
         decision_mode TEXT NOT NULL,
         keyword_rules_json TEXT NOT NULL,
+        keyword_alert_rules_json TEXT NOT NULL DEFAULT '[]',
         is_running INTEGER NOT NULL
     )
     """,
@@ -142,8 +143,26 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
 def init_schema(conn: sqlite3.Connection) -> None:
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
+    _migrate_tasks_keyword_alert_rules(conn)
     _migrate_result_items_status(conn)
     conn.commit()
+
+
+def _migrate_tasks_keyword_alert_rules(conn: sqlite3.Connection) -> None:
+    """为 tasks 表添加结构化关键词价格提醒规则列。"""
+    row = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = 'migration:tasks_keyword_alert_rules'"
+    ).fetchone()
+    if row is not None:
+        return
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    if "keyword_alert_rules_json" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN keyword_alert_rules_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO app_metadata(key, value) VALUES ('migration:tasks_keyword_alert_rules', 'done')"
+    )
 
 
 def _migrate_result_items_status(conn: sqlite3.Connection) -> None:

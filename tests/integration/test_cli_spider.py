@@ -95,3 +95,7 @@ def test_cli_runs_keyword_mode_without_prompt_files(tmp_path, load_json_fixture,
     assert len(captured) == 1
     assert captured[0]["decision_mode"] == "keyword"
     assert captured[0]["ai_prompt_text"] == ""
+    assert captured[0]["keyword_alert_rules"] == [
+        {"keyword": "a7m4", "max_price": None},
+        {"keyword": "验货宝", "max_price": None},
+    ]

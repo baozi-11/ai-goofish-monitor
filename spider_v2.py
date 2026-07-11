@@ -69,6 +69,37 @@ async def main():
             normalized.append(text)
         return normalized
 
+    def normalize_keyword_alert_rules(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_values = re.split(r"[\n,]+", value)
+        elif isinstance(value, (list, tuple, set)):
+            raw_values = list(value)
+        else:
+            raw_values = [value]
+
+        normalized = []
+        seen = set()
+        for item in raw_values:
+            if isinstance(item, dict):
+                keyword = str(item.get("keyword") or "").strip()
+                max_price = item.get("max_price")
+            else:
+                keyword = str(item or "").strip()
+                max_price = None
+            if not keyword:
+                continue
+            key = keyword.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({
+                "keyword": keyword,
+                "max_price": None if max_price in (None, "", "null", "undefined") else str(max_price).strip(),
+            })
+        return normalized
+
     def flatten_legacy_groups(groups):
         merged = []
         for group in groups or []:
@@ -107,6 +138,14 @@ async def main():
             task["keyword_rules"] = flatten_legacy_groups(task.get("keyword_rule_groups") or [])
         else:
             task["keyword_rules"] = normalize_keywords(keyword_rules)
+        task["keyword_alert_rules"] = normalize_keyword_alert_rules(
+            task.get("keyword_alert_rules")
+        )
+        if not task["keyword_alert_rules"] and task["keyword_rules"]:
+            task["keyword_alert_rules"] = [
+                {"keyword": keyword, "max_price": None}
+                for keyword in task["keyword_rules"]
+            ]
 
         if decision_mode == "keyword":
             task["ai_prompt_text"] = ""

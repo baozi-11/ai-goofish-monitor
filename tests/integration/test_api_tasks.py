@@ -63,6 +63,10 @@ def test_generate_keyword_mode_task_without_ai_criteria(api_client):
         "description": "",
         "decision_mode": "keyword",
         "keyword_rules": ["a7m4", "验货宝"],
+        "keyword_alert_rules": [
+            {"keyword": "a7m4", "max_price": "8500"},
+            {"keyword": "验货宝", "max_price": None},
+        ],
         "max_pages": 2,
         "personal_only": True,
     }
@@ -73,6 +77,10 @@ def test_generate_keyword_mode_task_without_ai_criteria(api_client):
     assert created["decision_mode"] == "keyword"
     assert created["ai_prompt_criteria_file"] == ""
     assert created["keyword_rules"] == ["a7m4", "验货宝"]
+    assert created["keyword_alert_rules"] == [
+        {"keyword": "a7m4", "max_price": "8500"},
+        {"keyword": "验货宝", "max_price": None},
+    ]
 
 
 def test_generate_ai_task_returns_job_and_completes_async(api_client, api_context, monkeypatch):

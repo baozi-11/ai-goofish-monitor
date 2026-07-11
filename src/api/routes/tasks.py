@@ -42,6 +42,10 @@ def _has_keyword_rules(rules) -> bool:
     return bool(rules and len(rules) > 0)
 
 
+def _has_keyword_alert_rules(rules) -> bool:
+    return bool(rules and len(rules) > 0)
+
+
 def _validate_final_account_strategy(existing_task, task_update: TaskUpdate) -> None:
     account_state_file = (
         task_update.account_state_file
@@ -165,7 +169,15 @@ async def update_task(
                 if task_update.keyword_rules is not None
                 else getattr(existing_task, "keyword_rules", [])
             )
-            if not _has_keyword_rules(final_rules):
+            final_alert_rules = (
+                task_update.keyword_alert_rules
+                if task_update.keyword_alert_rules is not None
+                else getattr(existing_task, "keyword_alert_rules", [])
+            )
+            if not (
+                _has_keyword_rules(final_rules)
+                or _has_keyword_alert_rules(final_alert_rules)
+            ):
                 raise HTTPException(status_code=400, detail="关键词模式下至少需要一个关键词。")
         if target_mode == "ai" and (description_changed or switched_to_ai):
             print(f"检测到任务 {task_id} 需要刷新 AI 标准文件，开始重新生成...")

@@ -34,6 +34,11 @@ from src.parsers import (
     parse_ratings_data,
     parse_user_head_data,
 )
+from src.keyword_rule_engine import (
+    build_search_text,
+    evaluate_keyword_rules,
+    extract_keywords_from_alert_rules,
+)
 from src.utils import (
     format_registration_days,
     get_link_unique_key,
@@ -53,10 +58,10 @@ from src.services.item_analysis_dispatcher import (
 from src.services.price_history_service import (
     build_market_reference,
     load_price_snapshots,
+    parse_price_value,
     record_market_snapshots,
 )
 from src.services.result_storage_service import load_processed_link_keys
-from src.services.seller_profile_cache import SellerProfileCache
 from src.services.search_pagination import (
     advance_search_page,
     is_search_results_response,
@@ -240,10 +245,95 @@ def _get_ai_analysis_concurrency(task_config: dict) -> int:
     return max(1, _as_int(configured, default))
 
 
-def _get_seller_profile_cache_ttl(task_config: dict) -> int:
-    configured = task_config.get("seller_profile_cache_ttl")
-    default = _as_int(os.getenv("SELLER_PROFILE_CACHE_TTL"), 1800)
-    return max(0, _as_int(configured, default))
+def _get_item_snapshot_keys(item: dict) -> set[str]:
+    keys = set()
+    item_id = str(item.get("商品ID") or "").strip()
+    link = str(item.get("商品链接") or "").strip()
+    if item_id:
+        keys.add(item_id)
+    if link:
+        keys.add(link)
+        keys.add(get_link_unique_key(link))
+    return keys
+
+
+def _find_latest_price_snapshot(item: dict, snapshots: list[dict]) -> Optional[dict]:
+    keys = _get_item_snapshot_keys(item)
+    if not keys:
+        return None
+    for snapshot in reversed(snapshots or []):
+        snapshot_keys = {
+            str(snapshot.get("item_id") or "").strip(),
+            str(snapshot.get("link") or "").strip(),
+        }
+        snapshot_keys = {key for key in snapshot_keys if key}
+        snapshot_keys.update(get_link_unique_key(key) for key in list(snapshot_keys))
+        if keys & snapshot_keys:
+            return snapshot
+    return None
+
+
+def _build_duplicate_drop_reason(
+    *,
+    previous_price: float,
+    current_price: float,
+    matched_keywords: list[str],
+) -> str:
+    drop_amount = round(previous_price - current_price, 2)
+    drop_percent = (
+        round(drop_amount / previous_price * 100, 2)
+        if previous_price > 0
+        else None
+    )
+    percent_text = f"，降幅 {drop_percent:g}%" if drop_percent is not None else ""
+    return (
+        f"重复商品降价：¥{previous_price:g} -> ¥{current_price:g}"
+        f"，降低 ¥{drop_amount:g}{percent_text}；"
+        f"命中关键词：{', '.join(matched_keywords)}"
+    )
+
+
+async def _notify_duplicate_price_drop_if_needed(
+    *,
+    item_data: dict,
+    previous_snapshots: list[dict],
+    keyword_rules: list[str],
+    keyword_alert_rules: list[dict],
+    decision_mode: str,
+) -> bool:
+    if decision_mode != "keyword":
+        return False
+
+    current_price = parse_price_value(item_data.get("当前售价"))
+    if current_price is None:
+        return False
+    previous_snapshot = _find_latest_price_snapshot(item_data, previous_snapshots)
+    if not previous_snapshot:
+        return False
+    previous_price = parse_price_value(previous_snapshot.get("price"))
+    if previous_price is None or current_price >= previous_price:
+        return False
+
+    match_keywords = (
+        extract_keywords_from_alert_rules(keyword_alert_rules)
+        or list(keyword_rules or [])
+    )
+    analysis = evaluate_keyword_rules(
+        match_keywords,
+        build_search_text({"商品信息": item_data}),
+    )
+    if not analysis.get("is_recommended"):
+        return False
+
+    await send_ntfy_notification(
+        item_data,
+        _build_duplicate_drop_reason(
+            previous_price=previous_price,
+            current_price=current_price,
+            matched_keywords=analysis.get("matched_keywords") or [],
+        ),
+    )
+    return True
 
 
 def _default_context_options() -> dict:
@@ -458,11 +548,18 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
     if decision_mode not in {"ai", "keyword"}:
         decision_mode = "ai"
     keyword_rules = task_config.get("keyword_rules") or []
+    keyword_alert_rules = task_config.get("keyword_alert_rules") or []
+    if not keyword_alert_rules and keyword_rules:
+        keyword_alert_rules = [
+            {"keyword": keyword_rule, "max_price": None}
+            for keyword_rule in keyword_rules
+        ]
     free_shipping = task_config.get("free_shipping", False)
     raw_new_publish = task_config.get("new_publish_option") or ""
     new_publish_option = raw_new_publish.strip()
     if new_publish_option == "__none__":
         new_publish_option = ""
+    is_latest_mode = new_publish_option == "最新"
     region_filter = (task_config.get("region") or "").strip()
 
     processed_links = set()
@@ -591,16 +688,14 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             context = await browser.new_context(
                 storage_state=storage_state_arg, **context_kwargs
             )
-            seller_profile_cache = SellerProfileCache(
-                ttl_seconds=_get_seller_profile_cache_ttl(task_config)
-            )
+
+            async def _empty_seller_loader(_user_id: str) -> dict:
+                return {}
+
             analysis_dispatcher = ItemAnalysisDispatcher(
                 concurrency=_get_ai_analysis_concurrency(task_config),
                 skip_ai_analysis=SKIP_AI_ANALYSIS,
-                seller_loader=lambda user_id: seller_profile_cache.get_or_load(
-                    str(user_id),
-                    lambda seller_key: scrape_user_profile(context, seller_key),
-                ),
+                seller_loader=_empty_seller_loader,
                 image_downloader=download_all_images,
                 ai_analyzer=get_ai_analysis,
                 notifier=send_ntfy_notification,
@@ -759,13 +854,18 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         print(f"LOG: 应用新发布筛选失败: {e}")
 
                 if personal_only:
-                    async with page.expect_response(
-                        is_search_results_response, timeout=20000
-                    ) as response_info:
-                        await page.click("text=个人闲置")
-                        # --- 修改: 将固定等待改为随机等待，并加长 ---
-                        await random_sleep(2, 4)  # 原来是 asyncio.sleep(5)
-                    final_response = await response_info.value
+                    try:
+                        async with page.expect_response(
+                            is_search_results_response, timeout=20000
+                        ) as response_info:
+                            await page.click("text=个人闲置")
+                            # --- 修改: 将固定等待改为随机等待，并加长 ---
+                            await random_sleep(2, 4)  # 原来是 asyncio.sleep(5)
+                        final_response = await response_info.value
+                    except PlaywrightTimeoutError:
+                        log_time("个人闲置筛选请求超时，继续执行。")
+                    except Exception as e:
+                        print(f"LOG: 应用个人闲置筛选失败: {e}")
 
                 if free_shipping:
                     try:
@@ -882,34 +982,39 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         print(f"LOG: 应用区域筛选 '{region_filter}' 失败: {e}")
 
                 if min_price or max_price:
-                    price_container = page.locator(
-                        'div[class*="search-price-input-container"]'
-                    ).first
-                    if await price_container.is_visible():
-                        if min_price:
-                            await price_container.get_by_placeholder("¥").first.fill(
-                                min_price
-                            )
-                            # --- 修改: 将固定等待改为随机等待 ---
-                            await random_sleep(1, 2.5)  # 原来是 asyncio.sleep(5)
-                        if max_price:
-                            await (
-                                price_container.get_by_placeholder("¥")
-                                .nth(1)
-                                .fill(max_price)
-                            )
-                            # --- 修改: 将固定等待改为随机等待 ---
-                            await random_sleep(1, 2.5)  # 原来是 asyncio.sleep(5)
+                    try:
+                        price_container = page.locator(
+                            'div[class*="search-price-input-container"]'
+                        ).first
+                        if await price_container.is_visible():
+                            if min_price:
+                                await price_container.get_by_placeholder("¥").first.fill(
+                                    min_price
+                                )
+                                # --- 修改: 将固定等待改为随机等待 ---
+                                await random_sleep(1, 2.5)  # 原来是 asyncio.sleep(5)
+                            if max_price:
+                                await (
+                                    price_container.get_by_placeholder("¥")
+                                    .nth(1)
+                                    .fill(max_price)
+                                )
+                                # --- 修改: 将固定等待改为随机等待 ---
+                                await random_sleep(1, 2.5)  # 原来是 asyncio.sleep(5)
 
-                        async with page.expect_response(
-                            is_search_results_response, timeout=20000
-                        ) as response_info:
-                            await page.keyboard.press("Tab")
-                            # --- 修改: 增加确认价格后的等待时间 ---
-                            await random_sleep(2, 4)  # 原来是 asyncio.sleep(5)
-                        final_response = await response_info.value
-                    else:
-                        print("LOG: 警告 - 未找到价格输入容器。")
+                            async with page.expect_response(
+                                is_search_results_response, timeout=20000
+                            ) as response_info:
+                                await page.keyboard.press("Tab")
+                                # --- 修改: 增加确认价格后的等待时间 ---
+                                await random_sleep(2, 4)  # 原来是 asyncio.sleep(5)
+                            final_response = await response_info.value
+                        else:
+                            print("LOG: 警告 - 未找到价格输入容器。")
+                    except PlaywrightTimeoutError:
+                        log_time("价格筛选请求超时，继续执行。")
+                    except Exception as e:
+                        print(f"LOG: 应用价格筛选失败: {e}")
 
                 log_time("所有筛选已完成，开始处理商品列表...")
 
@@ -941,6 +1046,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     )
                     if not basic_items:
                         break
+                    previous_snapshots = list(historical_snapshots)
                     historical_snapshots.extend(
                         record_market_snapshots(
                             keyword=keyword,
@@ -963,9 +1069,24 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
                         unique_key = get_link_unique_key(item_data["商品链接"])
                         if unique_key in processed_links:
-                            log_time(
-                                f"[页内进度 {i}/{total_items_on_page}] 商品 '{item_data['商品标题'][:20]}...' 已存在，跳过。"
+                            notified_drop = await _notify_duplicate_price_drop_if_needed(
+                                item_data=item_data,
+                                previous_snapshots=previous_snapshots,
+                                keyword_rules=keyword_rules,
+                                keyword_alert_rules=keyword_alert_rules,
+                                decision_mode=decision_mode,
                             )
+                            log_time(
+                                f"[页内进度 {i}/{total_items_on_page}] 商品 '{item_data['商品标题'][:20]}...' 已存在，"
+                                f"{'已发送降价提醒。' if notified_drop else '跳过。'}"
+                            )
+                            if is_latest_mode:
+                                log_time(
+                                    "最新模式遇到历史商品，停止继续同步，"
+                                    "不再拉取后续详情或分页。"
+                                )
+                                stop_scraping = True
+                                break
                             continue
 
                         log_time(
@@ -1093,6 +1214,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                         analyze_images=analyze_images,
                                         prompt_text=ai_prompt_text,
                                         keyword_rules=tuple(keyword_rules or []),
+                                        keyword_alert_rules=tuple(keyword_alert_rules or []),
                                         final_record=final_record,
                                         seller_id=str(user_id) if user_id else None,
                                         zhima_credit_text=zhima_credit_text,

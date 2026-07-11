@@ -74,6 +74,11 @@ def test_legacy_keyword_groups_are_flattened_to_keyword_rules():
     )
 
     assert task.keyword_rules == ["a7m4", "验货宝", "全画幅"]
+    assert [rule.model_dump() for rule in task.keyword_alert_rules] == [
+        {"keyword": "a7m4", "max_price": None},
+        {"keyword": "验货宝", "max_price": None},
+        {"keyword": "全画幅", "max_price": None},
+    ]
 
 
 def test_generate_request_accepts_legacy_group_payload():
@@ -85,6 +90,24 @@ def test_generate_request_accepts_legacy_group_payload():
         keyword_rule_groups=[{"include_keywords": ["a7m4", "验货宝"], "exclude_keywords": ["瑕疵"]}],
     )
     assert req.keyword_rules == ["a7m4", "验货宝"]
+    assert [rule.model_dump() for rule in req.keyword_alert_rules] == [
+        {"keyword": "a7m4", "max_price": None},
+        {"keyword": "验货宝", "max_price": None},
+    ]
+
+
+def test_generate_request_accepts_keyword_alert_rules_with_price():
+    req = TaskGenerateRequest(
+        task_name="price alert",
+        keyword="sony a7m4",
+        description="",
+        decision_mode="keyword",
+        keyword_alert_rules=[{"keyword": "a7m4", "max_price": 8500}],
+    )
+    assert req.keyword_rules == ["a7m4"]
+    assert [rule.model_dump() for rule in req.keyword_alert_rules] == [
+        {"keyword": "a7m4", "max_price": "8500"}
+    ]
 
 
 def test_generate_request_enables_image_analysis_by_default():

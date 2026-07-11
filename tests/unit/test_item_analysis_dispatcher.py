@@ -75,7 +75,7 @@ def test_item_analysis_dispatcher_uses_bounded_concurrency():
     assert len(saved_records) == 3
     assert len(notifications) == 3
     assert max_active_ai_calls == 2
-    assert saved_records[0][1]["卖家信息"]["卖家ID"].startswith("seller-")
+    assert saved_records[0][1]["卖家信息"]["卖家芝麻信用"] == "优秀"
 
 
 def test_item_analysis_dispatcher_supports_keyword_mode_without_ai():
@@ -114,7 +114,7 @@ def test_item_analysis_dispatcher_supports_keyword_mode_without_ai():
                 decision_mode="keyword",
                 analyze_images=False,
                 prompt_text="",
-                keyword_rules=("个人闲置",),
+                keyword_rules=("演示",),
                 final_record={
                     "商品信息": {"商品ID": "1", "商品标题": "演示商品"},
                     "卖家信息": {},

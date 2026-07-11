@@ -39,7 +39,7 @@ def parse_price_value(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return round(float(value), 2)
 
-    text = str(value).strip().replace("¥", "").replace(",", "")
+    text = str(value).strip().replace("¥", "").replace("￥", "").replace(",", "")
     if not text or text in {"价格异常", "暂无", "-", "N/A"}:
         return None
     if text.endswith("万"):
