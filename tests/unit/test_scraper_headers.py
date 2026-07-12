@@ -1,7 +1,7 @@
 from src.scraper import (
-    DETAIL_PAGE_GOTO_WAIT_UNTIL,
+    QUICK_NOTIFY_REASON,
     _build_extra_headers,
-    _get_detail_api_timeout_ms,
+    _build_search_list_result_record,
     _is_navigation_aborted_error,
 )
 
@@ -42,23 +42,36 @@ def test_is_navigation_aborted_error_ignores_other_errors():
     assert _is_navigation_aborted_error(Exception("Page.goto: net::ERR_TIMED_OUT")) is False
 
 
-def test_get_detail_api_timeout_ms_defaults_to_45000(monkeypatch):
-    monkeypatch.delenv("DETAIL_API_TIMEOUT_MS", raising=False)
+def test_build_search_list_result_record_marks_quick_notify_recommended():
+    item_data = {
+        "商品标题": "DIM 十字绣",
+        "当前售价": "100",
+        "商品链接": "https://www.goofish.com/item?id=1",
+        "商品ID": "1",
+        "商品主图链接": "https://img.example/item.jpg",
+        "商品图片列表": ["https://img.example/item.jpg"],
+        "发货地区": "上海",
+        "卖家昵称": "baozi",
+        "发布时间": "2026-07-12 19:00",
+        "商品标签": ["包邮"],
+        "“想要”人数": "3",
+    }
 
-    assert _get_detail_api_timeout_ms() == 45000
+    record = _build_search_list_result_record(
+        item_data=item_data,
+        keyword="dim十字绣",
+        task_name="dim十字绣",
+        scraped_at="2026-07-12T19:00:00",
+    )
 
-
-def test_get_detail_api_timeout_ms_uses_env_value(monkeypatch):
-    monkeypatch.setenv("DETAIL_API_TIMEOUT_MS", "25000")
-
-    assert _get_detail_api_timeout_ms() == 25000
-
-
-def test_get_detail_api_timeout_ms_falls_back_for_invalid_value(monkeypatch):
-    monkeypatch.setenv("DETAIL_API_TIMEOUT_MS", "invalid")
-
-    assert _get_detail_api_timeout_ms() == 45000
-
-
-def test_detail_page_goto_waits_for_commit_only():
-    assert DETAIL_PAGE_GOTO_WAIT_UNTIL == "commit"
+    assert record["爬取时间"] == "2026-07-12T19:00:00"
+    assert record["搜索关键字"] == "dim十字绣"
+    assert record["任务名称"] == "dim十字绣"
+    assert record["商品信息"] is item_data
+    assert record["卖家信息"] == {}
+    assert record["ai_analysis"] == {
+        "analysis_source": "quick_notify",
+        "is_recommended": True,
+        "reason": QUICK_NOTIFY_REASON,
+        "keyword_hit_count": 0,
+    }

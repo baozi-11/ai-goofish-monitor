@@ -1,5 +1,4 @@
 import asyncio
-from collections import deque
 import json
 import os
 import random
@@ -15,18 +14,13 @@ from playwright.async_api import (
 )
 
 from src.ai_handler import (
-    download_all_images,
-    get_ai_analysis,
     send_ntfy_notification,
     cleanup_task_images,
 )
 from src.config import (
-    AI_DEBUG_MODE,
-    DETAIL_API_URL_PATTERN,
     LOGIN_IS_EDGE,
     RUN_HEADLESS,
     RUNNING_IN_DOCKER,
-    SKIP_AI_ANALYSIS,
     STATE_FILE,
 )
 from src.parsers import (
@@ -42,7 +36,6 @@ from src.keyword_rule_engine import (
     extract_keywords_from_alert_rules,
 )
 from src.utils import (
-    format_registration_days,
     get_link_unique_key,
     log_time,
     random_sleep,
@@ -53,12 +46,7 @@ from src.rotation import RotationPool, load_state_files, parse_proxy_pool, Rotat
 from src.failure_guard import FailureGuard
 from src.services.account_strategy_service import resolve_account_runtime_plan
 from src.infrastructure.persistence.storage_names import build_result_filename
-from src.services.item_analysis_dispatcher import (
-    ItemAnalysisDispatcher,
-    ItemAnalysisJob,
-)
 from src.services.price_history_service import (
-    build_market_reference,
     load_price_snapshots,
     parse_price_value,
     record_market_snapshots,
@@ -83,17 +71,7 @@ EDGE_DOCKER_WARNING_PRINTED = False
 INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
 INITIAL_SEARCH_RESPONSE_RETRY_COUNT = 2
 INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
-DETAIL_API_TIMEOUT_ENV = "DETAIL_API_TIMEOUT_MS"
-DEFAULT_DETAIL_API_TIMEOUT_MS = 45_000
-MIN_DETAIL_API_TIMEOUT_MS = 5_000
-DETAIL_PAGE_GOTO_WAIT_UNTIL = "commit"
-DETAIL_DEBUG_RESPONSE_LIMIT = 12
-DETAIL_DEBUG_RESPONSE_MARKERS = (
-    "h5api",
-    "goofish",
-    "baxia",
-    "awsc",
-)
+QUICK_NOTIFY_REASON = "搜索列表发现新商品"
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -115,73 +93,22 @@ def _is_navigation_aborted_error(error: Exception) -> bool:
     return "net::ERR_ABORTED" in str(error)
 
 
-def _get_detail_api_timeout_ms() -> int:
-    raw_value = os.getenv(DETAIL_API_TIMEOUT_ENV)
-    if raw_value is None or str(raw_value).strip() == "":
-        return DEFAULT_DETAIL_API_TIMEOUT_MS
-    try:
-        timeout_ms = int(str(raw_value).strip())
-    except (TypeError, ValueError):
-        return DEFAULT_DETAIL_API_TIMEOUT_MS
-    if timeout_ms < MIN_DETAIL_API_TIMEOUT_MS:
-        return DEFAULT_DETAIL_API_TIMEOUT_MS
-    return timeout_ms
-
-
-def _is_detail_debug_response_url(url: str) -> bool:
-    lowered = (url or "").lower()
-    return any(marker in lowered for marker in DETAIL_DEBUG_RESPONSE_MARKERS)
-
-
-def _format_detail_debug_responses(recent_responses) -> str:
-    if not recent_responses:
-        return "      - no key responses captured"
-    lines = []
-    for status, url in recent_responses:
-        text_url = str(url)
-        if len(text_url) > 300:
-            text_url = text_url[:297] + "..."
-        lines.append(f"      - {status} {text_url}")
-    return "\n".join(lines)
-
-
-def _print_detail_page_timeout_debug(
-    *,
-    item_data: dict,
-    detail_page,
-    timeout_ms: int,
-    goto_completed: bool,
-    recent_responses,
-) -> None:
-    item_title = item_data.get("商品标题", "")
-    item_url = item_data.get("商品链接", "")
-    final_url = getattr(detail_page, "url", "")
-    saw_target_api = any(
-        DETAIL_API_URL_PATTERN in str(url) for _, url in recent_responses
-    )
-    saw_other_h5api = any(
-        "h5api" in str(url).lower() and DETAIL_API_URL_PATTERN not in str(url)
-        for _, url in recent_responses
-    )
-
-    if not goto_completed:
-        failure_type = "goto_timeout_or_error"
-    elif saw_target_api:
-        failure_type = "target_detail_api_seen_but_not_resolved"
-    elif saw_other_h5api:
-        failure_type = "goto_ok_but_target_detail_api_missing"
-    else:
-        failure_type = "goto_ok_but_no_key_api_response"
-
-    print("   [详情页超时诊断]")
-    print(f"      failure_type: {failure_type}")
-    print(f"      timeout_ms: {timeout_ms}")
-    print(f"      goto_completed: {goto_completed}")
-    print(f"      title: {item_title}")
-    print(f"      item_url: {item_url}")
-    print(f"      final_url: {final_url}")
-    print("      recent_key_responses:")
-    print(_format_detail_debug_responses(recent_responses))
+def _build_search_list_result_record(
+    *, item_data: dict, keyword: str, task_name: str, scraped_at: Optional[str] = None
+) -> dict:
+    return {
+        "爬取时间": scraped_at or datetime.now().isoformat(),
+        "搜索关键字": keyword,
+        "任务名称": task_name,
+        "商品信息": item_data,
+        "卖家信息": {},
+        "ai_analysis": {
+            "analysis_source": "quick_notify",
+            "is_recommended": True,
+            "reason": QUICK_NOTIFY_REASON,
+            "keyword_hit_count": 0,
+        },
+    }
 
 
 async def _is_locator_visible(locator, timeout_ms: int) -> bool:
@@ -240,13 +167,6 @@ def _build_browser_env_without_global_proxy() -> dict:
     for key in PROXY_ENV_KEYS:
         browser_env.pop(key, None)
     return browser_env
-
-
-def _should_analyze_images(task_config: dict) -> bool:
-    raw_value = task_config.get("analyze_images", True)
-    if isinstance(raw_value, bool):
-        return raw_value
-    return str(raw_value).strip().lower() not in {"false", "0", "no", "off"}
 
 
 def _format_failure_reason(reason: str, limit: int = 500) -> str:
@@ -379,12 +299,6 @@ def _get_rotation_settings(task_config: dict) -> dict:
         "proxy_retry_limit": max(1, proxy_retry_limit),
         "proxy_blacklist_ttl": max(0, proxy_blacklist_ttl),
     }
-
-
-def _get_ai_analysis_concurrency(task_config: dict) -> int:
-    configured = task_config.get("ai_analysis_concurrency")
-    default = _as_int(os.getenv("AI_ANALYSIS_CONCURRENCY"), 2)
-    return max(1, _as_int(configured, default))
 
 
 def _get_item_snapshot_keys(item: dict) -> set[str]:
@@ -685,8 +599,6 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
     personal_only = task_config.get("personal_only", False)
     min_price = task_config.get("min_price")
     max_price = task_config.get("max_price")
-    ai_prompt_text = task_config.get("ai_prompt_text", "")
-    analyze_images = _should_analyze_images(task_config)
     decision_mode = str(task_config.get("decision_mode", "ai")).strip().lower()
     if decision_mode not in {"ai", "keyword"}:
         decision_mode = "ai"
@@ -814,7 +726,6 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
             context_kwargs = _default_context_options()
             storage_state_arg = state_file
-            analysis_dispatcher: Optional[ItemAnalysisDispatcher] = None
 
             if isinstance(snapshot_data, dict):
                 # 新版扩展导出的增强快照，包含环境和Header
@@ -834,19 +745,6 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             context_kwargs = _clean_kwargs(context_kwargs)
             context = await browser.new_context(
                 storage_state=storage_state_arg, **context_kwargs
-            )
-
-            async def _empty_seller_loader(_user_id: str) -> dict:
-                return {}
-
-            analysis_dispatcher = ItemAnalysisDispatcher(
-                concurrency=_get_ai_analysis_concurrency(task_config),
-                skip_ai_analysis=SKIP_AI_ANALYSIS,
-                seller_loader=_empty_seller_loader,
-                image_downloader=download_all_images,
-                ai_analyzer=get_ai_analysis,
-                notifier=send_ntfy_notification,
-                saver=save_to_jsonl,
             )
 
             # 增强反检测脚本（模拟真实移动设备）
@@ -1278,206 +1176,27 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             continue
 
                         log_time(
-                            f"[页内进度 {i}/{total_items_on_page}] 发现新商品，获取详情: {item_data['商品标题'][:30]}..."
+                            f"[页内进度 {i}/{total_items_on_page}] 发现新商品，保存并通知: {item_data['商品标题'][:30]}..."
                         )
-                        # --- 修改: 访问详情页前的等待时间，模拟用户在列表页上看了一会儿 ---
-                        await random_sleep(2, 4)  # 原来是 (2, 4)
-
-                        detail_timeout_ms = _get_detail_api_timeout_ms()
-                        recent_detail_responses = deque(
-                            maxlen=DETAIL_DEBUG_RESPONSE_LIMIT
+                        final_record = _build_search_list_result_record(
+                            item_data=item_data,
+                            keyword=keyword,
+                            task_name=task_config.get("task_name", "Untitled Task"),
                         )
-                        goto_completed = False
-                        detail_page = await context.new_page()
-
-                        def record_detail_response(response: Response):
-                            if _is_detail_debug_response_url(response.url):
-                                recent_detail_responses.append(
-                                    (response.status, response.url)
-                                )
-
-                        detail_page.on("response", record_detail_response)
-                        try:
-                            async with detail_page.expect_response(
-                                lambda r: DETAIL_API_URL_PATTERN in r.url,
-                                timeout=detail_timeout_ms,
-                            ) as detail_info:
-                                await detail_page.goto(
-                                    item_data["商品链接"],
-                                    wait_until=DETAIL_PAGE_GOTO_WAIT_UNTIL,
-                                    timeout=detail_timeout_ms,
-                                )
-                                goto_completed = True
-
-                            detail_response = await detail_info.value
-                            if detail_response.ok:
-                                detail_json = await detail_response.json()
-
-                                ret_string = str(
-                                    await safe_get(detail_json, "ret", default=[])
-                                )
-                                if "FAIL_SYS_USER_VALIDATE" in ret_string:
-                                    print(
-                                        "\n==================== CRITICAL BLOCK DETECTED ===================="
-                                    )
-                                    print(
-                                        "检测到闲鱼反爬虫验证 (FAIL_SYS_USER_VALIDATE)，程序将终止。"
-                                    )
-                                    long_sleep_duration = random.randint(3, 60)
-                                    print(
-                                        f"为避免账户风险，将执行一次长时间休眠 ({long_sleep_duration} 秒) 后再退出..."
-                                    )
-                                    await asyncio.sleep(long_sleep_duration)
-                                    print("长时间休眠结束，现在将安全退出。")
-                                    print(
-                                        "==================================================================="
-                                    )
-                                    raise RiskControlError("FAIL_SYS_USER_VALIDATE")
-
-                                # 解析商品详情数据并更新 item_data
-                                item_do = await safe_get(
-                                    detail_json, "data", "itemDO", default={}
-                                )
-                                seller_do = await safe_get(
-                                    detail_json, "data", "sellerDO", default={}
-                                )
-
-                                reg_days_raw = await safe_get(
-                                    seller_do, "userRegDay", default=0
-                                )
-                                registration_duration_text = format_registration_days(
-                                    reg_days_raw
-                                )
-
-                                # --- START: 新增代码块 ---
-
-                                # 1. 提取卖家的芝麻信用信息
-                                zhima_credit_text = await safe_get(
-                                    seller_do, "zhimaLevelInfo", "levelName"
-                                )
-
-                                # 2. 提取该商品的完整图片列表
-                                image_infos = await safe_get(
-                                    item_do, "imageInfos", default=[]
-                                )
-                                if image_infos:
-                                    # 使用列表推导式获取所有有效的图片URL
-                                    all_image_urls = [
-                                        img.get("url")
-                                        for img in image_infos
-                                        if img.get("url")
-                                    ]
-                                    if all_image_urls:
-                                        # 用新的字段存储图片列表，替换掉旧的单个链接
-                                        item_data["商品图片列表"] = all_image_urls
-                                        # (可选) 仍然保留主图链接，以防万一
-                                        item_data["商品主图链接"] = all_image_urls[0]
-
-                                # --- END: 新增代码块 ---
-                                item_data["“想要”人数"] = await safe_get(
-                                    item_do,
-                                    "wantCnt",
-                                    default=item_data.get("“想要”人数", "NaN"),
-                                )
-                                item_data["浏览量"] = await safe_get(
-                                    item_do, "browseCnt", default="-"
-                                )
-                                # ...[此处可添加更多从详情页解析出的商品信息]...
-
-                                user_id = await safe_get(seller_do, "sellerId")
-
-                                # 构建基础记录
-                                final_record = {
-                                    "爬取时间": datetime.now().isoformat(),
-                                    "搜索关键字": keyword,
-                                    "任务名称": task_config.get(
-                                        "task_name", "Untitled Task"
-                                    ),
-                                    "商品信息": item_data,
-                                    "卖家信息": {},
-                                }
-                                price_reference = build_market_reference(
-                                    keyword=keyword,
-                                    item=item_data,
-                                    current_market_items=basic_items,
-                                    historical_snapshots=historical_snapshots,
-                                )
-                                final_record["价格参考"] = price_reference
-                                final_record["price_insight"] = price_reference.get(
-                                    "本商品价格位置", {}
-                                )
-
-                                analysis_dispatcher.submit(
-                                    ItemAnalysisJob(
-                                        keyword=keyword,
-                                        task_name=task_config.get(
-                                            "task_name", "Untitled Task"
-                                        ),
-                                        decision_mode=decision_mode,
-                                        analyze_images=analyze_images,
-                                        prompt_text=ai_prompt_text,
-                                        keyword_rules=tuple(keyword_rules or []),
-                                        keyword_alert_rules=tuple(keyword_alert_rules or []),
-                                        final_record=final_record,
-                                        seller_id=str(user_id) if user_id else None,
-                                        zhima_credit_text=zhima_credit_text,
-                                        registration_duration_text=registration_duration_text,
-                                    )
-                                )
-
-                                processed_links.add(unique_key)
-                                processed_item_count += 1
-                                log_time(
-                                    f"商品已提交后台分析。累计处理 {processed_item_count} 个新商品。"
-                                )
-
-                                # --- 修改: 增加单个商品处理后的主要延迟 ---
-                                log_time(
-                                    "[反爬] 执行一次主要的随机延迟以模拟用户浏览间隔..."
-                                )
-                                await random_sleep(5, 10)
-                            else:
-                                print(
-                                    f"   错误: 获取商品详情API响应失败，状态码: {detail_response.status}"
-                                )
-                                if AI_DEBUG_MODE:
-                                    print(
-                                        f"--- [DETAIL DEBUG] FAILED RESPONSE from {item_data['商品链接']} ---"
-                                    )
-                                    try:
-                                        print(await detail_response.text())
-                                    except Exception as e:
-                                        print(f"无法读取响应内容: {e}")
-                                    print(
-                                        "----------------------------------------------------"
-                                    )
-
-                        except PlaywrightTimeoutError:
-                            print(
-                                f"   错误: 访问商品详情页或等待API响应超时。timeout_ms={detail_timeout_ms}"
+                        if await save_to_jsonl(final_record, keyword):
+                            processed_links.add(unique_key)
+                            processed_item_count += 1
+                            log_time(
+                                f"商品已保存。累计处理 {processed_item_count} 个新商品。"
                             )
-                            _print_detail_page_timeout_debug(
-                                item_data=item_data,
-                                detail_page=detail_page,
-                                timeout_ms=detail_timeout_ms,
-                                goto_completed=goto_completed,
-                                recent_responses=tuple(recent_detail_responses),
-                            )
-                        except PlaywrightError as e:
-                            print(f"   错误: 访问商品详情页失败: {e}")
-                            _print_detail_page_timeout_debug(
-                                item_data=item_data,
-                                detail_page=detail_page,
-                                timeout_ms=detail_timeout_ms,
-                                goto_completed=goto_completed,
-                                recent_responses=tuple(recent_detail_responses),
-                            )
-                        except Exception as e:
-                            print(f"   错误: 处理商品详情时发生未知错误: {e}")
-                        finally:
-                            await detail_page.close()
-                            # --- 修改: 增加关闭页面后的短暂整理时间 ---
-                            await random_sleep(2, 4)  # 原来是 (1, 2.5)
+                            try:
+                                await send_ntfy_notification(
+                                    item_data, QUICK_NOTIFY_REASON
+                                )
+                            except Exception as e:
+                                print(f"   [通知] 发送失败: {e}")
+                        else:
+                            print("   错误: 保存搜索列表基础记录失败，跳过通知。")
 
                     # --- 新增: 在处理完一页所有商品后，翻页前，增加一个更长的“休息”时间 ---
                     if not stop_scraping and page_num < max_pages:
@@ -1507,9 +1226,6 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                 print(f"\n爬取过程中发生未知错误: {e}")
                 raise
             finally:
-                if analysis_dispatcher is not None:
-                    log_time("等待后台分析任务完成...")
-                    await analysis_dispatcher.join()
                 log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
                 await asyncio.sleep(5)
                 if debug_limit:

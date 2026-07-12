@@ -55,6 +55,8 @@ async def _parse_search_results_json(json_data: dict, source: str) -> list:
                 "商品标签": tags,
                 "发货地区": area,
                 "卖家昵称": seller,
+                "商品主图链接": image_url,
+                "商品图片列表": [image_url] if image_url else [],
                 "商品链接": raw_link.replace("fleamarket://", "https://www.goofish.com/"),
                 "发布时间": datetime.fromtimestamp(int(pub_time_ts)/1000).strftime("%Y-%m-%d %H:%M") if pub_time_ts.isdigit() else "未知时间",
                 "商品ID": item_id

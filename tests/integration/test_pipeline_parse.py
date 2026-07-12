@@ -19,6 +19,8 @@ def test_parse_search_results(load_json_fixture):
     assert "包邮" in item["商品标签"]
     assert "验货宝" in item["商品标签"]
     assert item["商品链接"].startswith("https://www.goofish.com/")
+    assert item["商品主图链接"]
+    assert item["商品图片列表"] == [item["商品主图链接"]]
 
 
 def test_parse_user_head_and_items(load_json_fixture):
