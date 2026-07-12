@@ -86,6 +86,7 @@ INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
 DETAIL_API_TIMEOUT_ENV = "DETAIL_API_TIMEOUT_MS"
 DEFAULT_DETAIL_API_TIMEOUT_MS = 45_000
 MIN_DETAIL_API_TIMEOUT_MS = 5_000
+DETAIL_PAGE_GOTO_WAIT_UNTIL = "commit"
 DETAIL_DEBUG_RESPONSE_LIMIT = 12
 DETAIL_DEBUG_RESPONSE_MARKERS = (
     "h5api",
@@ -1303,7 +1304,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             ) as detail_info:
                                 await detail_page.goto(
                                     item_data["商品链接"],
-                                    wait_until="domcontentloaded",
+                                    wait_until=DETAIL_PAGE_GOTO_WAIT_UNTIL,
                                     timeout=detail_timeout_ms,
                                 )
                                 goto_completed = True

@@ -1,4 +1,5 @@
 from src.scraper import (
+    DETAIL_PAGE_GOTO_WAIT_UNTIL,
     _build_extra_headers,
     _get_detail_api_timeout_ms,
     _is_navigation_aborted_error,
@@ -57,3 +58,7 @@ def test_get_detail_api_timeout_ms_falls_back_for_invalid_value(monkeypatch):
     monkeypatch.setenv("DETAIL_API_TIMEOUT_MS", "invalid")
 
     assert _get_detail_api_timeout_ms() == 45000
+
+
+def test_detail_page_goto_waits_for_commit_only():
+    assert DETAIL_PAGE_GOTO_WAIT_UNTIL == "commit"
