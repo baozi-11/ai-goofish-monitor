@@ -79,7 +79,7 @@ def test_webhook_client_renders_json_templates(monkeypatch):
     assert captured["data"] is None
 
 
-def test_ntfy_client_uses_bark_style_body_and_attaches_image(monkeypatch):
+def test_ntfy_client_uses_compact_body_and_attaches_image(monkeypatch):
     captured = {}
 
     class _FakeResponse:
@@ -114,7 +114,8 @@ def test_ntfy_client_uses_bark_style_body_and_attaches_image(monkeypatch):
 
     body = captured["data"].decode("utf-8")
     assert captured["url"] == "https://ntfy.sh/demo-topic"
-    assert body.startswith("🚨 新推荐! Sony A7M4\n\n价格: 9999\n原因: 价格合适")
+    assert body.startswith("价格: 9999\n原因: 价格合适")
+    assert "🚨 新推荐! Sony A7M4" not in body
     assert "手机端链接: https://pages.goofish.com/sharexy?" in body
     assert captured["headers"]["Title"] == "🚨 新推荐! Sony A7M4".encode("utf-8")
     assert captured["headers"]["Priority"] == "urgent"

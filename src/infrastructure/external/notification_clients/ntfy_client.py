@@ -24,8 +24,6 @@ class NtfyClient(NotificationClient):
 
         message = self._build_message(product_data, reason)
         content_lines = [
-            message.notification_title,
-            "",
             f"价格: {message.price}",
             f"原因: {message.reason}",
         ]
