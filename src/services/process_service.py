@@ -32,6 +32,8 @@ class ProcessService:
         self.task_names: Dict[int, str] = {}
         self.exit_watchers: Dict[int, asyncio.Task] = {}
         self.failure_guard = FailureGuard()
+        self.last_start_failure_reason: str | None = None
+        self.last_start_skip_decision = None
         self._on_started: LifecycleHook | None = None
         self._on_stopped: LifecycleHook | None = None
 
@@ -132,8 +134,11 @@ class ProcessService:
 
     async def start_task(self, task_id: int, task_name: str) -> bool:
         """启动任务进程"""
+        self.last_start_failure_reason = None
+        self.last_start_skip_decision = None
         await self._drain_finished_process(task_id)
         if self.is_running(task_id):
+            self.last_start_failure_reason = "already_running"
             print(f"任务 '{task_name}' (ID: {task_id}) 已在运行中")
             return False
 
@@ -142,6 +147,8 @@ class ProcessService:
             cookie_path=self._resolve_cookie_path(task_name),
         )
         if decision.skip:
+            self.last_start_failure_reason = "failure_guard_paused"
+            self.last_start_skip_decision = decision
             await self._notify_skip(task_name, decision)
             return False
 
@@ -152,6 +159,7 @@ class ProcessService:
             process = await self._spawn_process(task_name, log_file_handle)
         except Exception as exc:
             self._close_log_handle(log_file_handle)
+            self.last_start_failure_reason = "spawn_failed"
             print(f"启动任务 '{task_name}' 失败: {exc}")
             return False
 

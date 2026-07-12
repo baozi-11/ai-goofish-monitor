@@ -277,6 +277,30 @@ async def start_task(
         raise HTTPException(status_code=400, detail="任务已在运行中")
     success = await process_service.start_task(task_id, task.task_name)
     if not success:
+        if getattr(process_service, "last_start_failure_reason", None) == "failure_guard_paused":
+            decision = getattr(process_service, "last_start_skip_decision", None)
+            paused_until = getattr(decision, "paused_until", None)
+            consecutive_failures = getattr(decision, "consecutive_failures", None)
+            reason = getattr(decision, "reason", "") or "未知错误"
+            paused_until_text = (
+                paused_until.strftime("%Y-%m-%d %H:%M:%S")
+                if paused_until
+                else "N/A"
+            )
+            threshold = getattr(process_service.failure_guard, "threshold", "?")
+            failure_text = (
+                f"{consecutive_failures}/{threshold}"
+                if consecutive_failures is not None
+                else f"?/{threshold}"
+            )
+            raise HTTPException(
+                status_code=423,
+                detail=(
+                    f"任务已暂停重试，连续失败 {failure_text}。"
+                    f"原因: {reason}。暂停到: {paused_until_text}。"
+                    "请重新导出登录态后再启动。"
+                ),
+            )
         raise HTTPException(status_code=500, detail="启动任务失败")
     return {"message": f"任务 '{task.task_name}' 已启动"}
 @router.post("/stop/{task_id}", response_model=dict)

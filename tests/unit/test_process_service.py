@@ -74,6 +74,28 @@ def test_process_service_marks_task_stopped_when_process_exits(monkeypatch, tmp_
     asyncio.run(run_scenario())
 
 
+def test_process_service_records_failure_guard_pause(monkeypatch):
+    async def run_scenario():
+        service = ProcessService()
+        decision = SimpleNamespace(
+            skip=True,
+            should_notify=False,
+            reason="login expired",
+            consecutive_failures=3,
+            paused_until=None,
+        )
+        service.failure_guard.should_skip_start = lambda *args, **kwargs: decision
+        monkeypatch.setattr(service, "_resolve_cookie_path", lambda _task_name: None)
+
+        started = await service.start_task(0, "task-a")
+
+        assert started is False
+        assert service.last_start_failure_reason == "failure_guard_paused"
+        assert service.last_start_skip_decision is decision
+
+    asyncio.run(run_scenario())
+
+
 def test_process_service_reindexes_runtime_maps_after_delete():
     service = ProcessService()
     proc_a = object()
