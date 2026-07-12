@@ -111,6 +111,24 @@ def _build_search_list_result_record(
     }
 
 
+def _search_response_has_result_list(json_data: dict) -> bool:
+    data = json_data.get("data") if isinstance(json_data, dict) else None
+    return isinstance(data, dict) and "resultList" in data
+
+
+def _format_search_response_summary(json_data: dict) -> str:
+    if not isinstance(json_data, dict):
+        return f"response_type={type(json_data).__name__}"
+    data = json_data.get("data")
+    data_keys = sorted(data.keys())[:10] if isinstance(data, dict) else []
+    return (
+        f"api={json_data.get('api', '-')}, "
+        f"ret={json_data.get('ret', '-')}, "
+        f"data_type={type(data).__name__}, "
+        f"data_keys={data_keys}"
+    )
+
+
 async def _is_locator_visible(locator, timeout_ms: int) -> bool:
     try:
         await locator.wait_for(state="visible", timeout=timeout_ms)
@@ -1127,9 +1145,33 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         log_time(f"第 {page_num} 页响应无效，跳过。")
                         continue
 
+                    search_json = await current_response.json()
                     basic_items = await _parse_search_results_json(
-                        await current_response.json(), f"第 {page_num} 页"
+                        search_json, f"第 {page_num} 页"
                     )
+                    if not basic_items and not _search_response_has_result_list(
+                        search_json
+                    ):
+                        log_time(
+                            "搜索响应缺少 resultList，"
+                            f"摘要: {_format_search_response_summary(search_json)}"
+                        )
+                        if page_num == 1 and current_response is not initial_response:
+                            log_time("尝试回退解析初始搜索响应。")
+                            initial_search_json = await initial_response.json()
+                            basic_items = await _parse_search_results_json(
+                                initial_search_json, f"第 {page_num} 页(初始响应回退)"
+                            )
+                            if (
+                                not basic_items
+                                and not _search_response_has_result_list(
+                                    initial_search_json
+                                )
+                            ):
+                                log_time(
+                                    "初始搜索响应也缺少 resultList，"
+                                    f"摘要: {_format_search_response_summary(initial_search_json)}"
+                                )
                     if not basic_items:
                         break
                     previous_snapshots = list(historical_snapshots)

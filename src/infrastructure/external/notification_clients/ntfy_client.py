@@ -23,17 +23,31 @@ class NtfyClient(NotificationClient):
             raise RuntimeError("Ntfy 未启用")
 
         message = self._build_message(product_data, reason)
+        content_lines = [
+            message.notification_title,
+            "",
+            f"价格: {message.price}",
+            f"原因: {message.reason}",
+        ]
+        if message.mobile_link:
+            content_lines.append(f"手机端链接: {message.mobile_link}")
+
+        headers = {
+            "Title": message.notification_title.encode('utf-8'),
+            "Priority": "urgent",
+            "Tags": "bell,vibration",
+        }
+        if message.image_url:
+            headers["Attach"] = message.image_url
+
+        ntfy_message = "\n".join(content_lines)
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
             lambda: requests.post(
                 self.topic_url,
-                data=message.content.encode('utf-8'),
-                headers={
-                    "Title": message.notification_title.encode('utf-8'),
-                    "Priority": "urgent",
-                    "Tags": "bell,vibration"
-                },
+                data=ntfy_message.encode('utf-8'),
+                headers=headers,
                 timeout=10
             )
         )
