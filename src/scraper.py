@@ -475,10 +475,11 @@ def _build_context_overrides(snapshot: dict) -> dict:
 def _build_extra_headers(raw_headers: Optional[dict]) -> dict:
     if not raw_headers:
         return {}
-    excluded = {"cookie", "content-length"}
+    allowed = {"accept-language"}
     headers = {}
     for key, value in raw_headers.items():
-        if not key or key.lower() in excluded or value is None:
+        normalized_key = str(key).strip().lower() if key else ""
+        if normalized_key not in allowed or value is None:
             continue
         headers[key] = value
     return headers

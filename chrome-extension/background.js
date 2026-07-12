@@ -165,22 +165,7 @@ function pruneStorageEntries(entries = {}) {
 function filterHeaders(rawHeaders = {}) {
   const allowList = [
     "user-agent",
-    "accept",
     "accept-language",
-    "accept-encoding",
-    "referer",
-    "sec-ch-ua",
-    "sec-ch-ua-mobile",
-    "sec-ch-ua-platform",
-    "sec-fetch-site",
-    "sec-fetch-mode",
-    "sec-fetch-dest",
-    "sec-fetch-user",
-    "origin",
-    "cache-control",
-    "pragma",
-    "upgrade-insecure-requests",
-    "content-type",
   ];
   const normalized = {};
   Object.entries(rawHeaders).forEach(([k, v]) => {
