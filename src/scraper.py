@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import json
 import os
 import random
@@ -82,6 +83,16 @@ EDGE_DOCKER_WARNING_PRINTED = False
 INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
 INITIAL_SEARCH_RESPONSE_RETRY_COUNT = 2
 INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
+DETAIL_API_TIMEOUT_ENV = "DETAIL_API_TIMEOUT_MS"
+DEFAULT_DETAIL_API_TIMEOUT_MS = 45_000
+MIN_DETAIL_API_TIMEOUT_MS = 5_000
+DETAIL_DEBUG_RESPONSE_LIMIT = 12
+DETAIL_DEBUG_RESPONSE_MARKERS = (
+    "h5api",
+    "goofish",
+    "baxia",
+    "awsc",
+)
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -101,6 +112,75 @@ def _is_login_url(url: str) -> bool:
 
 def _is_navigation_aborted_error(error: Exception) -> bool:
     return "net::ERR_ABORTED" in str(error)
+
+
+def _get_detail_api_timeout_ms() -> int:
+    raw_value = os.getenv(DETAIL_API_TIMEOUT_ENV)
+    if raw_value is None or str(raw_value).strip() == "":
+        return DEFAULT_DETAIL_API_TIMEOUT_MS
+    try:
+        timeout_ms = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_DETAIL_API_TIMEOUT_MS
+    if timeout_ms < MIN_DETAIL_API_TIMEOUT_MS:
+        return DEFAULT_DETAIL_API_TIMEOUT_MS
+    return timeout_ms
+
+
+def _is_detail_debug_response_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(marker in lowered for marker in DETAIL_DEBUG_RESPONSE_MARKERS)
+
+
+def _format_detail_debug_responses(recent_responses) -> str:
+    if not recent_responses:
+        return "      - no key responses captured"
+    lines = []
+    for status, url in recent_responses:
+        text_url = str(url)
+        if len(text_url) > 300:
+            text_url = text_url[:297] + "..."
+        lines.append(f"      - {status} {text_url}")
+    return "\n".join(lines)
+
+
+def _print_detail_page_timeout_debug(
+    *,
+    item_data: dict,
+    detail_page,
+    timeout_ms: int,
+    goto_completed: bool,
+    recent_responses,
+) -> None:
+    item_title = item_data.get("商品标题", "")
+    item_url = item_data.get("商品链接", "")
+    final_url = getattr(detail_page, "url", "")
+    saw_target_api = any(
+        DETAIL_API_URL_PATTERN in str(url) for _, url in recent_responses
+    )
+    saw_other_h5api = any(
+        "h5api" in str(url).lower() and DETAIL_API_URL_PATTERN not in str(url)
+        for _, url in recent_responses
+    )
+
+    if not goto_completed:
+        failure_type = "goto_timeout_or_error"
+    elif saw_target_api:
+        failure_type = "target_detail_api_seen_but_not_resolved"
+    elif saw_other_h5api:
+        failure_type = "goto_ok_but_target_detail_api_missing"
+    else:
+        failure_type = "goto_ok_but_no_key_api_response"
+
+    print("   [详情页超时诊断]")
+    print(f"      failure_type: {failure_type}")
+    print(f"      timeout_ms: {timeout_ms}")
+    print(f"      goto_completed: {goto_completed}")
+    print(f"      title: {item_title}")
+    print(f"      item_url: {item_url}")
+    print(f"      final_url: {final_url}")
+    print("      recent_key_responses:")
+    print(_format_detail_debug_responses(recent_responses))
 
 
 async def _is_locator_visible(locator, timeout_ms: int) -> bool:
@@ -1202,16 +1282,31 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                         # --- 修改: 访问详情页前的等待时间，模拟用户在列表页上看了一会儿 ---
                         await random_sleep(2, 4)  # 原来是 (2, 4)
 
+                        detail_timeout_ms = _get_detail_api_timeout_ms()
+                        recent_detail_responses = deque(
+                            maxlen=DETAIL_DEBUG_RESPONSE_LIMIT
+                        )
+                        goto_completed = False
                         detail_page = await context.new_page()
+
+                        def record_detail_response(response: Response):
+                            if _is_detail_debug_response_url(response.url):
+                                recent_detail_responses.append(
+                                    (response.status, response.url)
+                                )
+
+                        detail_page.on("response", record_detail_response)
                         try:
                             async with detail_page.expect_response(
-                                lambda r: DETAIL_API_URL_PATTERN in r.url, timeout=25000
+                                lambda r: DETAIL_API_URL_PATTERN in r.url,
+                                timeout=detail_timeout_ms,
                             ) as detail_info:
                                 await detail_page.goto(
                                     item_data["商品链接"],
                                     wait_until="domcontentloaded",
-                                    timeout=25000,
+                                    timeout=detail_timeout_ms,
                                 )
+                                goto_completed = True
 
                             detail_response = await detail_info.value
                             if detail_response.ok:
@@ -1357,7 +1452,25 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                                     )
 
                         except PlaywrightTimeoutError:
-                            print(f"   错误: 访问商品详情页或等待API响应超时。")
+                            print(
+                                f"   错误: 访问商品详情页或等待API响应超时。timeout_ms={detail_timeout_ms}"
+                            )
+                            _print_detail_page_timeout_debug(
+                                item_data=item_data,
+                                detail_page=detail_page,
+                                timeout_ms=detail_timeout_ms,
+                                goto_completed=goto_completed,
+                                recent_responses=tuple(recent_detail_responses),
+                            )
+                        except PlaywrightError as e:
+                            print(f"   错误: 访问商品详情页失败: {e}")
+                            _print_detail_page_timeout_debug(
+                                item_data=item_data,
+                                detail_page=detail_page,
+                                timeout_ms=detail_timeout_ms,
+                                goto_completed=goto_completed,
+                                recent_responses=tuple(recent_detail_responses),
+                            )
                         except Exception as e:
                             print(f"   错误: 处理商品详情时发生未知错误: {e}")
                         finally:
