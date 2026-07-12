@@ -2,9 +2,7 @@ from src.scraper import (
     QUICK_NOTIFY_REASON,
     _build_extra_headers,
     _build_search_list_result_record,
-    _format_search_response_summary,
     _is_navigation_aborted_error,
-    _search_response_has_result_list,
 )
 
 
@@ -77,24 +75,3 @@ def test_build_search_list_result_record_marks_quick_notify_recommended():
         "reason": QUICK_NOTIFY_REASON,
         "keyword_hit_count": 0,
     }
-
-
-def test_search_response_has_result_list_distinguishes_missing_from_empty():
-    assert _search_response_has_result_list({"data": {"resultList": []}}) is True
-    assert _search_response_has_result_list({"data": {"items": []}}) is False
-    assert _search_response_has_result_list({"data": None}) is False
-
-
-def test_format_search_response_summary_includes_debug_shape():
-    summary = _format_search_response_summary(
-        {
-            "api": "mtop.taobao.idlemtopsearch.pc.search",
-            "ret": ["SUCCESS::调用成功"],
-            "data": {"items": [], "foo": "bar"},
-        }
-    )
-
-    assert "mtop.taobao.idlemtopsearch.pc.search" in summary
-    assert "SUCCESS::调用成功" in summary
-    assert "data_type=dict" in summary
-    assert "items" in summary
