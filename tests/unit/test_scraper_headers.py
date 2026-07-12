@@ -1,4 +1,4 @@
-from src.scraper import _build_extra_headers
+from src.scraper import _build_extra_headers, _is_navigation_aborted_error
 
 
 def test_build_extra_headers_filters_browser_controlled_headers():
@@ -23,3 +23,15 @@ def test_build_extra_headers_filters_browser_controlled_headers():
     assert _build_extra_headers(raw_headers) == {
         "Accept-Language": "zh-CN,zh;q=0.9"
     }
+
+
+def test_is_navigation_aborted_error_detects_playwright_goto_abort():
+    error = Exception(
+        "Page.goto: net::ERR_ABORTED at https://www.goofish.com/search?q=test"
+    )
+
+    assert _is_navigation_aborted_error(error) is True
+
+
+def test_is_navigation_aborted_error_ignores_other_errors():
+    assert _is_navigation_aborted_error(Exception("Page.goto: net::ERR_TIMED_OUT")) is False

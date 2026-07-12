@@ -7,6 +7,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 from playwright.async_api import (
+    Error as PlaywrightError,
     Response,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
@@ -96,6 +97,10 @@ def _is_login_url(url: str) -> bool:
         return False
     lowered = url.lower()
     return "passport.goofish.com" in lowered or "mini_login" in lowered
+
+
+def _is_navigation_aborted_error(error: Exception) -> bool:
+    return "net::ERR_ABORTED" in str(error)
 
 
 async def _is_locator_visible(locator, timeout_ms: int) -> bool:
@@ -849,6 +854,22 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             "不计为失败保护。"
                         )
                         return 0
+                    except PlaywrightError as e:
+                        if _is_login_url(page.url):
+                            raise LoginRequiredError(
+                                f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                            ) from e
+                        if not _is_navigation_aborted_error(e):
+                            raise
+                        await _raise_if_security_challenge(page, keyword, timeout_ms=1000)
+                        if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
+                            log_time(
+                                "初始搜索页导航被浏览器取消(net::ERR_ABORTED)，"
+                                f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
+                            )
+                            await asyncio.sleep(INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS)
+                            continue
+                        raise
 
                 # 等待页面加载出关键筛选元素，以确认已成功进入搜索结果页
                 try:
