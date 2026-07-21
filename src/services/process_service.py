@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import subprocess
 import sys
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, TextIO
@@ -174,6 +175,17 @@ class ProcessService:
         log_file_handle = None
         try:
             log_file_path, log_file_handle = self._open_log_file(task_id, task_name)
+            command = self._build_spawn_command(
+                task_name,
+                persistent_schedule=persistent_schedule,
+            )
+            command_text = "启动命令: " + subprocess.list2cmdline(command)
+            print(command_text)
+            try:
+                log_file_handle.write(command_text + "\n")
+                log_file_handle.flush()
+            except Exception:
+                pass
             process = await self._spawn_process(
                 task_name,
                 log_file_handle,

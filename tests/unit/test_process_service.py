@@ -146,3 +146,21 @@ def test_process_service_adds_persistent_schedule_arg_for_scheduled_workers():
         "task-a",
         "--persistent-schedule",
     ]
+
+
+def test_process_service_keeps_debug_limit_with_persistent_schedule(monkeypatch):
+    monkeypatch.setenv("SPIDER_DEBUG_LIMIT", "2")
+    service = ProcessService()
+
+    command = service._build_spawn_command("task-a", persistent_schedule=True)
+
+    assert command == [
+        sys.executable,
+        "-u",
+        "spider_v2.py",
+        "--task-name",
+        "task-a",
+        "--persistent-schedule",
+        "--debug-limit",
+        "2",
+    ]

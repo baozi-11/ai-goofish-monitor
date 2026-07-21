@@ -4,6 +4,8 @@ from src.scraper import (
     ReusableSearchSession,
     _build_task_filter_signature,
     _can_reuse_search_session,
+    _requires_confirmed_filter_response,
+    _select_search_response_for_processing,
 )
 
 
@@ -49,3 +51,30 @@ def test_can_reuse_search_session_rejects_filter_changes():
         state_file="state/baozi-175.json",
         proxy_server=None,
     ) is False
+
+
+class _FakeResponse:
+    def __init__(self, ok: bool):
+        self.ok = ok
+
+
+def test_select_search_response_requires_filter_response_when_publish_filter_configured():
+    initial_response = _FakeResponse(ok=True)
+
+    assert _requires_confirmed_filter_response({"new_publish_option": "最新"}) is True
+    assert _select_search_response_for_processing(
+        initial_response=initial_response,
+        final_response=None,
+        requires_filter_response=True,
+    ) is None
+
+
+def test_select_search_response_allows_initial_response_without_publish_filter():
+    initial_response = _FakeResponse(ok=True)
+
+    assert _requires_confirmed_filter_response({"new_publish_option": ""}) is False
+    assert _select_search_response_for_processing(
+        initial_response=initial_response,
+        final_response=None,
+        requires_filter_response=False,
+    ) is initial_response
