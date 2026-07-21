@@ -4,9 +4,14 @@ import asyncio
 from src.scraper import (
     ReusableSearchSession,
     NEW_PUBLISH_POPUP_SELECTOR,
+    NewPublishOptionNotFoundError,
+    NewPublishPopupNotFoundError,
+    PlaywrightTimeoutError,
     _build_task_filter_signature,
     _can_reuse_search_session,
     _click_new_publish_option_in_open_filter,
+    _capture_search_response_after_action,
+    _find_new_publish_option_in_open_filter,
     _open_new_publish_filter,
     _requires_confirmed_filter_response,
     _select_latest_ok_search_response,
@@ -97,10 +102,11 @@ def test_select_latest_ok_search_response_uses_last_successful_response():
 
 
 class _FakeLocator:
-    def __init__(self, page, name: str, count: int = 1):
+    def __init__(self, page, name: str, count: int = 1, visible: bool = True):
         self.page = page
         self.name = name
         self._count = count
+        self.visible = visible
         self.clicks = 0
         self.wait_calls = []
         self.first = self
@@ -112,8 +118,15 @@ class _FakeLocator:
     async def click(self):
         self.clicks += 1
 
+    async def is_visible(self):
+        return self.visible
+
     async def wait_for(self, **kwargs):
         self.wait_calls.append(kwargs)
+
+    def nth(self, index: int):
+        self.page.nth_calls.append((self.name, index))
+        return self
 
     def filter(self, **kwargs):
         self.page.filter_calls.append(kwargs)
@@ -134,6 +147,7 @@ class _FakePage:
         self.locator_calls = []
         self.locator_text_calls = []
         self.filter_calls = []
+        self.nth_calls = []
 
     def get_by_text(self, text: str, exact: bool = False):
         self.text_calls.append((text, exact))
@@ -160,3 +174,81 @@ def test_click_new_publish_option_uses_scoped_popup_locator():
     assert page.locator_text_calls == [("popup", "最新", True)]
     assert page.option_locator.clicks == 1
     assert page.page_clicks == []
+
+
+def test_find_new_publish_option_reports_missing_popup_before_response_wait():
+    page = _FakePage()
+    page.popup_locator._count = 0
+    page.option_locator._count = 0
+
+    try:
+        asyncio.run(_find_new_publish_option_in_open_filter(page, "最新"))
+    except NewPublishPopupNotFoundError as exc:
+        assert str(exc) == "新发布筛选弹层未出现"
+    else:
+        raise AssertionError("expected NewPublishPopupNotFoundError")
+
+
+def test_find_new_publish_option_reports_missing_option_before_response_wait():
+    page = _FakePage()
+    page.option_locator._count = 0
+
+    try:
+        asyncio.run(_find_new_publish_option_in_open_filter(page, "最新"))
+    except NewPublishOptionNotFoundError as exc:
+        assert str(exc) == "新发布选项 '最新' 未找到"
+    else:
+        raise AssertionError("expected NewPublishOptionNotFoundError")
+
+
+class _FakeTimeoutExpectResponse:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        if exc_type is None:
+            raise PlaywrightTimeoutError("no search response")
+        return False
+
+
+class _FakeNoResponsePage:
+    def __init__(self):
+        self.expect_response_calls = 0
+        self.listener_events = []
+
+    def on(self, event: str, callback):
+        self.listener_events.append(("on", event))
+
+    def remove_listener(self, event: str, callback):
+        self.listener_events.append(("remove", event))
+
+    def expect_response(self, predicate, timeout: int):
+        self.expect_response_calls += 1
+        self.expect_response_timeout = timeout
+        return _FakeTimeoutExpectResponse()
+
+
+def test_capture_search_response_timeout_happens_after_successful_click_action():
+    page = _FakeNoResponsePage()
+    action_calls = []
+
+    async def action():
+        action_calls.append("clicked")
+
+    try:
+        asyncio.run(
+            _capture_search_response_after_action(
+                page=page,
+                action=action,
+                timeout_ms=20000,
+                settle_min_seconds=0,
+                settle_max_seconds=0,
+            )
+        )
+    except PlaywrightTimeoutError:
+        assert action_calls == ["clicked"]
+        assert page.expect_response_calls == 1
+        assert page.expect_response_timeout == 20000
+        assert page.listener_events == [("on", "response"), ("remove", "response")]
+    else:
+        raise AssertionError("expected PlaywrightTimeoutError")

@@ -67,6 +67,18 @@ class LoginRequiredError(Exception):
     """Raised when Goofish redirects to the passport/mini_login flow."""
 
 
+class NewPublishFilterError(Exception):
+    """新发布筛选的业务异常，用于区分页面定位失败和接口响应超时。"""
+
+
+class NewPublishPopupNotFoundError(NewPublishFilterError):
+    """点击“新发布”后没有找到筛选弹层，通常是页面结构或风控状态变化。"""
+
+
+class NewPublishOptionNotFoundError(NewPublishFilterError):
+    """筛选弹层已出现，但没有找到任务配置对应的发布时间选项。"""
+
+
 @dataclass
 class ReusableSearchSession:
     """保存定时监控可复用的浏览器页面和筛选状态。"""
@@ -205,32 +217,69 @@ def _has_live_page(session: Optional[ReusableSearchSession]) -> bool:
 async def _open_new_publish_filter(page: Any) -> None:
     """打开“新发布”筛选弹层，优先使用精确文本避免点到相似入口。"""
     trigger = page.get_by_text("新发布", exact=True).first
-    if await trigger.count():
-        await trigger.click()
-        return
-    await page.click("text=新发布")
+    try:
+        if await trigger.count():
+            await trigger.click()
+            return
+        await page.click("text=新发布")
+    except PlaywrightTimeoutError as e:
+        raise NewPublishPopupNotFoundError("新发布筛选入口未找到") from e
+
+
+async def _first_visible_locator(locator: Any, max_candidates: int = 20) -> Optional[Any]:
+    """从候选定位器中挑选第一个可见节点，兼容弹层类名变化后的兜底查找。"""
+    count = await locator.count()
+    for index in range(min(count, max_candidates)):
+        candidate = locator.nth(index)
+        try:
+            if await candidate.is_visible():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+async def _find_new_publish_option_in_open_filter(
+    page: Any,
+    new_publish_option: str,
+) -> Any:
+    """定位新发布筛选选项，区分弹层缺失和选项缺失两类页面状态。"""
+    option_text = str(new_publish_option).strip()
+    popup = page.locator(NEW_PUBLISH_POPUP_SELECTOR).filter(
+        has=page.get_by_text(option_text, exact=True)
+    ).last
+
+    popup_exists = bool(await popup.count())
+    if popup_exists:
+        try:
+            await popup.wait_for(state="visible", timeout=5000)
+        except PlaywrightTimeoutError as e:
+            raise NewPublishPopupNotFoundError("新发布筛选弹层未出现") from e
+        option = popup.get_by_text(option_text, exact=True)
+        visible_option = await _first_visible_locator(option)
+        if visible_option is not None:
+            return visible_option
+
+    # 闲鱼前端偶尔会更换弹层容器类名；兜底只选可见的精确文本候选。
+    fallback_option = page.get_by_text(option_text, exact=True)
+    visible_fallback = await _first_visible_locator(fallback_option)
+    if visible_fallback is not None:
+        return visible_fallback
+
+    if not popup_exists:
+        raise NewPublishPopupNotFoundError("新发布筛选弹层未出现")
+    raise NewPublishOptionNotFoundError(f"新发布选项 '{option_text}' 未找到")
 
 
 async def _click_new_publish_option_in_open_filter(
     page: Any,
     new_publish_option: str,
 ) -> None:
-    """只在已打开的筛选弹层里选择发布时间范围，避免误点页面其它“最新”文案。"""
-    option_text = str(new_publish_option).strip()
-    popup = page.locator(NEW_PUBLISH_POPUP_SELECTOR).filter(
-        has=page.get_by_text(option_text, exact=True)
-    ).last
-    if not await popup.count():
-        raise PlaywrightTimeoutError(
-            f"new-publish-option-popup-not-found:{option_text}"
-        )
-
-    await popup.wait_for(state="visible", timeout=5000)
-    option = popup.get_by_text(option_text, exact=True).first
-    if not await option.count():
-        raise PlaywrightTimeoutError(
-            f"new-publish-option-not-found:{option_text}"
-        )
+    """只点击已确认可见的发布时间范围选项，避免误报接口超时。"""
+    option = await _find_new_publish_option_in_open_filter(
+        page,
+        new_publish_option,
+    )
     await option.click()
 
 
@@ -1178,12 +1227,15 @@ async def scrape_xianyu(
                     log_time(f"新发布筛选: {new_publish_option}")
                     await _open_new_publish_filter(page)
                     await random_sleep(1, 2)  # 原来是 (1.5, 2.5)
-
-                    async def _click_new_publish_option() -> None:
-                        await _click_new_publish_option_in_open_filter(
+                    new_publish_option_locator = (
+                        await _find_new_publish_option_in_open_filter(
                             page,
                             new_publish_option,
                         )
+                    )
+
+                    async def _click_new_publish_option() -> None:
+                        await new_publish_option_locator.click()
 
                     final_response = await _capture_search_response_after_action(
                         page=page,
@@ -1192,9 +1244,18 @@ async def scrape_xianyu(
                         settle_min_seconds=2,
                         settle_max_seconds=4,
                     )
+                except NewPublishPopupNotFoundError as e:
+                    log_time(
+                        f"{e}，无法应用新发布筛选 '{new_publish_option}'，"
+                        "本轮跳过并关闭复用会话。"
+                    )
+                    return 0
+                except NewPublishOptionNotFoundError as e:
+                    log_time(f"{e}，本轮跳过并关闭复用会话。")
+                    return 0
                 except PlaywrightTimeoutError:
                     log_time(
-                        f"新发布筛选 '{new_publish_option}' 请求超时，"
+                        f"新发布筛选 '{new_publish_option}' 接口响应超时(20秒)，"
                         "本轮跳过并关闭复用会话。"
                     )
                     return 0
