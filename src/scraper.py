@@ -112,6 +112,12 @@ INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
 INITIAL_SEARCH_RESPONSE_RETRY_COUNT = 2
 INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
 QUICK_NOTIFY_REASON = "搜索列表发现新商品"
+NEW_PUBLISH_POPUP_SELECTOR = (
+    "div.ant-popover, div.ant-select-dropdown, div.ant-dropdown, "
+    "div[role='tooltip'], div[role='menu'], "
+    "div[class*='Popover'], div[class*='popover'], "
+    "div[class*='Dropdown'], div[class*='dropdown']"
+)
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -172,6 +178,17 @@ def _select_search_response_for_processing(
     return initial_response
 
 
+def _select_latest_ok_search_response(
+    first_response: Optional[Any],
+    captured_responses: list[Any],
+) -> Optional[Any]:
+    """从同一次筛选动作捕获到的响应中选择最后一个成功结果，避免旧请求抢先返回。"""
+    for response in reversed(captured_responses):
+        if getattr(response, "ok", False):
+            return response
+    return first_response
+
+
 def _has_live_page(session: Optional[ReusableSearchSession]) -> bool:
     page = session.page if session is not None else None
     if page is None:
@@ -183,6 +200,73 @@ def _has_live_page(session: Optional[ReusableSearchSession]) -> bool:
         except Exception:
             return False
     return True
+
+
+async def _open_new_publish_filter(page: Any) -> None:
+    """打开“新发布”筛选弹层，优先使用精确文本避免点到相似入口。"""
+    trigger = page.get_by_text("新发布", exact=True).first
+    if await trigger.count():
+        await trigger.click()
+        return
+    await page.click("text=新发布")
+
+
+async def _click_new_publish_option_in_open_filter(
+    page: Any,
+    new_publish_option: str,
+) -> None:
+    """只在已打开的筛选弹层里选择发布时间范围，避免误点页面其它“最新”文案。"""
+    option_text = str(new_publish_option).strip()
+    popup = page.locator(NEW_PUBLISH_POPUP_SELECTOR).filter(
+        has=page.get_by_text(option_text, exact=True)
+    ).last
+    if not await popup.count():
+        raise PlaywrightTimeoutError(
+            f"new-publish-option-popup-not-found:{option_text}"
+        )
+
+    await popup.wait_for(state="visible", timeout=5000)
+    option = popup.get_by_text(option_text, exact=True).first
+    if not await option.count():
+        raise PlaywrightTimeoutError(
+            f"new-publish-option-not-found:{option_text}"
+        )
+    await option.click()
+
+
+async def _capture_search_response_after_action(
+    *,
+    page: Any,
+    action: Any,
+    timeout_ms: int,
+    settle_min_seconds: float,
+    settle_max_seconds: float,
+) -> Optional[Any]:
+    """执行筛选动作并收集其后的搜索响应，返回页面稳定前最后一个成功响应。"""
+    captured_responses: list[Any] = []
+
+    def _capture_response(response: Any) -> None:
+        if is_search_results_response(response):
+            captured_responses.append(response)
+
+    page.on("response", _capture_response)
+    try:
+        async with page.expect_response(
+            is_search_results_response,
+            timeout=timeout_ms,
+        ) as response_info:
+            await action()
+        first_response = await response_info.value
+        await random_sleep(settle_min_seconds, settle_max_seconds)
+        return _select_latest_ok_search_response(first_response, captured_responses)
+    finally:
+        remove_listener = getattr(page, "remove_listener", None)
+        if callable(remove_listener):
+            remove_listener("response", _capture_response)
+        else:
+            off = getattr(page, "off", None)
+            if callable(off):
+                off("response", _capture_response)
 
 
 def _is_login_url(url: str) -> bool:
@@ -1092,15 +1176,22 @@ async def scrape_xianyu(
             if new_publish_option:
                 try:
                     log_time(f"新发布筛选: {new_publish_option}")
-                    await page.click("text=新发布")
+                    await _open_new_publish_filter(page)
                     await random_sleep(1, 2)  # 原来是 (1.5, 2.5)
-                    async with page.expect_response(
-                        is_search_results_response, timeout=20000
-                    ) as response_info:
-                        await page.click(f"text={new_publish_option}")
-                        # --- 修改: 增加排序后的等待时间 ---
-                        await random_sleep(2, 4)  # 原来是 (3, 5)
-                    final_response = await response_info.value
+
+                    async def _click_new_publish_option() -> None:
+                        await _click_new_publish_option_in_open_filter(
+                            page,
+                            new_publish_option,
+                        )
+
+                    final_response = await _capture_search_response_after_action(
+                        page=page,
+                        action=_click_new_publish_option,
+                        timeout_ms=20000,
+                        settle_min_seconds=2,
+                        settle_max_seconds=4,
+                    )
                 except PlaywrightTimeoutError:
                     log_time(
                         f"新发布筛选 '{new_publish_option}' 请求超时，"
