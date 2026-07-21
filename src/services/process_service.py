@@ -88,7 +88,12 @@ class ProcessService:
         log_file_handle = open(log_file_path, "a", encoding="utf-8")
         return log_file_path, log_file_handle
 
-    def _build_spawn_command(self, task_name: str) -> list[str]:
+    def _build_spawn_command(
+        self,
+        task_name: str,
+        *,
+        persistent_schedule: bool = False,
+    ) -> list[str]:
         command = [
             sys.executable,
             "-u",
@@ -96,6 +101,8 @@ class ProcessService:
             "--task-name",
             task_name,
         ]
+        if persistent_schedule:
+            command.append("--persistent-schedule")
         debug_limit = str(os.getenv(SPIDER_DEBUG_LIMIT_ENV, "")).strip()
         if debug_limit.isdigit() and int(debug_limit) > 0:
             command.extend(["--debug-limit", debug_limit])
@@ -105,13 +112,18 @@ class ProcessService:
         self,
         task_name: str,
         log_file_handle: TextIO,
+        *,
+        persistent_schedule: bool = False,
     ) -> asyncio.subprocess.Process:
         preexec_fn = os.setsid if sys.platform != "win32" else None
         child_env = os.environ.copy()
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
         return await asyncio.create_subprocess_exec(
-            *self._build_spawn_command(task_name),
+            *self._build_spawn_command(
+                task_name,
+                persistent_schedule=persistent_schedule,
+            ),
             stdout=log_file_handle,
             stderr=log_file_handle,
             preexec_fn=preexec_fn,
@@ -132,7 +144,13 @@ class ProcessService:
         self.task_names[task_id] = task_name
         self.exit_watchers[task_id] = asyncio.create_task(self._watch_process_exit(process))
 
-    async def start_task(self, task_id: int, task_name: str) -> bool:
+    async def start_task(
+        self,
+        task_id: int,
+        task_name: str,
+        *,
+        persistent_schedule: bool = False,
+    ) -> bool:
         """启动任务进程"""
         self.last_start_failure_reason = None
         self.last_start_skip_decision = None
@@ -156,7 +174,11 @@ class ProcessService:
         log_file_handle = None
         try:
             log_file_path, log_file_handle = self._open_log_file(task_id, task_name)
-            process = await self._spawn_process(task_name, log_file_handle)
+            process = await self._spawn_process(
+                task_name,
+                log_file_handle,
+                persistent_schedule=persistent_schedule,
+            )
         except Exception as exc:
             self._close_log_handle(log_file_handle)
             self.last_start_failure_reason = "spawn_failed"

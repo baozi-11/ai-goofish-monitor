@@ -54,7 +54,7 @@ def test_start_stop_task_updates_status(api_client, api_context, sample_task_pay
     assert response.json()["is_running"] is False
 
     process_service = api_context["process_service"]
-    assert process_service.started == [(0, sample_task_payload["task_name"])]
+    assert process_service.started == [(0, sample_task_payload["task_name"], False)]
     assert process_service.stopped == [0]
 
 

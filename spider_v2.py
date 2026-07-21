@@ -6,128 +6,97 @@ import json
 import signal
 import contextlib
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from src.config import STATE_FILE
+from src.core.cron_utils import build_cron_trigger
 from src.infrastructure.persistence.sqlite_task_repository import SqliteTaskRepository
-from src.scraper import scrape_xianyu
+from src.scraper import ReusableSearchSession, scrape_xianyu
 
 
-async def main():
-    parser = argparse.ArgumentParser(
-        description="闲鱼商品监控脚本，支持多任务配置和实时AI分析。",
-        epilog="""
-使用示例:
-  # 运行 config.json 中定义的所有任务
-  python spider_v2.py
-
-  # 只运行名为 "Sony A7M4" 的任务 (通常由调度器调用)
-  python spider_v2.py --task-name "Sony A7M4"
-
-  # 调试模式: 运行所有任务，但每个任务只处理前3个新发现的商品
-  python spider_v2.py --debug-limit 3
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--debug-limit", type=int, default=0, help="调试模式：每个任务仅处理前 N 个新商品（0 表示无限制）")
-    parser.add_argument("--config", type=str, help="指定任务配置文件路径（传入时优先读取 JSON）")
-    parser.add_argument("--task-name", type=str, help="只运行指定名称的单个任务 (用于定时任务调度)")
-    args = parser.parse_args()
-
-    if args.config:
-        if not os.path.exists(args.config):
-            sys.exit(f"错误: 配置文件 '{args.config}' 不存在。")
-        try:
-            with open(args.config, 'r', encoding='utf-8') as f:
-                tasks_config = json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            sys.exit(f"错误: 读取或解析配置文件 '{args.config}' 失败: {e}")
+def normalize_keywords(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = re.split(r"[\n,]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
     else:
-        repository = SqliteTaskRepository()
-        tasks = await repository.find_all()
-        tasks_config = [task.dict() for task in tasks]
+        raw_values = [value]
 
-    def normalize_keywords(value):
-        if value is None:
-            return []
-        if isinstance(value, str):
-            raw_values = re.split(r"[\n,]+", value)
-        elif isinstance(value, (list, tuple, set)):
-            raw_values = list(value)
+    normalized = []
+    seen = set()
+    for item in raw_values:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def normalize_keyword_alert_rules(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = re.split(r"[\n,]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        raw_values = [value]
+
+    normalized = []
+    seen = set()
+    for item in raw_values:
+        if isinstance(item, dict):
+            keyword = str(item.get("keyword") or "").strip()
+            max_price = item.get("max_price")
         else:
-            raw_values = [value]
+            keyword = str(item or "").strip()
+            max_price = None
+        if not keyword:
+            continue
+        key = keyword.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "keyword": keyword,
+            "max_price": None if max_price in (None, "", "null", "undefined") else str(max_price).strip(),
+        })
+    return normalized
 
-        normalized = []
-        seen = set()
-        for item in raw_values:
-            text = str(item).strip()
-            if not text:
-                continue
-            key = text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(text)
-        return normalized
 
-    def normalize_keyword_alert_rules(value):
-        if value is None:
-            return []
-        if isinstance(value, str):
-            raw_values = re.split(r"[\n,]+", value)
-        elif isinstance(value, (list, tuple, set)):
-            raw_values = list(value)
-        else:
-            raw_values = [value]
+def flatten_legacy_groups(groups):
+    merged = []
+    for group in groups or []:
+        if isinstance(group, dict):
+            merged.extend(normalize_keywords(group.get("include_keywords")))
+    return normalize_keywords(merged)
 
-        normalized = []
-        seen = set()
-        for item in raw_values:
-            if isinstance(item, dict):
-                keyword = str(item.get("keyword") or "").strip()
-                max_price = item.get("max_price")
-            else:
-                keyword = str(item or "").strip()
-                max_price = None
-            if not keyword:
-                continue
-            key = keyword.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append({
-                "keyword": keyword,
-                "max_price": None if max_price in (None, "", "null", "undefined") else str(max_price).strip(),
-            })
-        return normalized
 
-    def flatten_legacy_groups(groups):
-        merged = []
-        for group in groups or []:
-            if isinstance(group, dict):
-                merged.extend(normalize_keywords(group.get("include_keywords")))
-        return normalize_keywords(merged)
+def has_bound_account(tasks: list) -> bool:
+    for task in tasks:
+        account = task.get("account_state_file")
+        if isinstance(account, str) and account.strip():
+            return True
+    return False
 
-    def has_bound_account(tasks: list) -> bool:
-        for task in tasks:
-            account = task.get("account_state_file")
-            if isinstance(account, str) and account.strip():
+
+def has_any_state_file() -> bool:
+    state_dir = os.getenv("ACCOUNT_STATE_DIR", "state").strip().strip('"').strip("'")
+    if os.path.isdir(state_dir):
+        for name in os.listdir(state_dir):
+            if name.endswith(".json"):
                 return True
-        return False
+    return False
 
-    def has_any_state_file() -> bool:
-        state_dir = os.getenv("ACCOUNT_STATE_DIR", "state").strip().strip('"').strip("'")
-        if os.path.isdir(state_dir):
-            for name in os.listdir(state_dir):
-                if name.endswith(".json"):
-                    return True
-        return False
 
-    if not os.path.exists(STATE_FILE) and not has_bound_account(tasks_config) and not has_any_state_file():
-        sys.exit(
-            f"错误: 未找到登录状态文件。请在 state/ 中添加账号或配置 account_state_file。"
-        )
-
-    # 读取所有prompt文件内容（关键词模式不需要加载prompt）
+def prepare_task_configs(tasks_config: list) -> list:
     for task in tasks_config:
         decision_mode = str(task.get("decision_mode", "ai")).strip().lower()
         if decision_mode not in {"ai", "keyword"}:
@@ -157,10 +126,10 @@ async def main():
                     base_prompt = f_base.read()
                 with open(task["ai_prompt_criteria_file"], 'r', encoding='utf-8') as f_criteria:
                     criteria_text = f_criteria.read()
-                
+
                 # 动态组合成最终的Prompt
                 task['ai_prompt_text'] = base_prompt.replace("{{CRITERIA_SECTION}}", criteria_text)
-                
+
                 # 验证生成的prompt是否有效
                 if len(task['ai_prompt_text']) < 100:
                     print(f"警告: 任务 '{task['task_name']}' 生成的prompt过短 ({len(task['ai_prompt_text'])} 字符)，可能存在问题。")
@@ -186,6 +155,115 @@ async def main():
             except Exception as e:
                 print(f"错误: 任务 '{task['task_name']}' 读取prompt文件时发生异常: {e}，该任务的AI分析将被跳过。")
                 task['ai_prompt_text'] = ""
+    return tasks_config
+
+
+async def load_tasks_config(config_path: str | None = None) -> list:
+    if config_path:
+        if not os.path.exists(config_path):
+            sys.exit(f"错误: 配置文件 '{config_path}' 不存在。")
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                tasks_config = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            sys.exit(f"错误: 读取或解析配置文件 '{config_path}' 失败: {e}")
+    else:
+        repository = SqliteTaskRepository()
+        tasks = await repository.find_all()
+        tasks_config = [task.dict() for task in tasks]
+
+    if not os.path.exists(STATE_FILE) and not has_bound_account(tasks_config) and not has_any_state_file():
+        sys.exit(
+            f"错误: 未找到登录状态文件。请在 state/ 中添加账号或配置 account_state_file。"
+        )
+    return prepare_task_configs(tasks_config)
+
+
+def find_active_task(tasks_config: list, task_name: str) -> dict | None:
+    task_found = next(
+        (task for task in tasks_config if task.get('task_name') == task_name),
+        None,
+    )
+    if task_found and task_found.get("enabled", False):
+        return task_found
+    return None
+
+
+def seconds_until_next_run(task_config: dict) -> float | None:
+    cron = task_config.get("cron")
+    if not cron:
+        return None
+    timezone = ZoneInfo("Asia/Shanghai")
+    trigger = build_cron_trigger(cron, timezone=timezone)
+    now = datetime.now(timezone)
+    next_run = trigger.get_next_fire_time(None, now)
+    if next_run is None:
+        return None
+    return max(0.0, (next_run - now).total_seconds())
+
+
+async def run_persistent_schedule_worker(args, stop_event: asyncio.Event) -> None:
+    session = ReusableSearchSession()
+    try:
+        while not stop_event.is_set():
+            tasks_config = await load_tasks_config(args.config)
+            task_config = find_active_task(tasks_config, args.task_name)
+            if task_config is None:
+                print(f"任务 '{args.task_name}' 已被删除或禁用，常驻 worker 退出。")
+                break
+
+            print(f"-> 任务 '{task_config['task_name']}' 开始执行本轮定时同步。")
+            try:
+                result = await scrape_xianyu(
+                    task_config=task_config,
+                    debug_limit=args.debug_limit,
+                    reusable_session=session,
+                )
+                print(f"任务 '{task_config['task_name']}' 本轮正常结束，共处理 {result} 个新商品。")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"任务 '{task_config['task_name']}' 本轮因异常而终止: {exc}")
+
+            delay_seconds = seconds_until_next_run(task_config)
+            if delay_seconds is None:
+                print(f"任务 '{task_config['task_name']}' 未配置 cron，常驻 worker 退出。")
+                break
+            print(f"下一轮同步将在 {delay_seconds:.0f} 秒后开始。")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay_seconds)
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        await session.close()
+
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="闲鱼商品监控脚本，支持多任务配置和实时AI分析。",
+        epilog="""
+使用示例:
+  # 运行 config.json 中定义的所有任务
+  python spider_v2.py
+
+  # 只运行名为 "Sony A7M4" 的任务 (通常由调度器调用)
+  python spider_v2.py --task-name "Sony A7M4"
+
+  # 调试模式: 运行所有任务，但每个任务只处理前3个新发现的商品
+  python spider_v2.py --debug-limit 3
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--debug-limit", type=int, default=0, help="调试模式：每个任务仅处理前 N 个新商品（0 表示无限制）")
+    parser.add_argument("--config", type=str, help="指定任务配置文件路径（传入时优先读取 JSON）")
+    parser.add_argument("--task-name", type=str, help="只运行指定名称的单个任务 (用于定时任务调度)")
+    parser.add_argument("--persistent-schedule", action="store_true", help="定时任务常驻模式：保留已筛选页面并按 cron 循环同步")
+    args = parser.parse_args()
+
+    if args.persistent_schedule and not args.task_name:
+        sys.exit("错误: --persistent-schedule 必须与 --task-name 一起使用。")
+
+    tasks_config = await load_tasks_config(args.config)
 
     print("\n--- 开始执行监控任务 ---")
     if args.debug_limit > 0:
@@ -224,6 +302,12 @@ async def main():
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
             pass
+
+    if args.persistent_schedule:
+        print("** 常驻定时模式：成功同步后将保留已筛选页面 **")
+        await run_persistent_schedule_worker(args, stop_event)
+        print("\n--- 所有任务执行完毕 ---")
+        return
 
     tasks = []
     for task_conf in active_task_configs:

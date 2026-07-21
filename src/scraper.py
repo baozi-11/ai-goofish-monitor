@@ -2,8 +2,9 @@ import asyncio
 import json
 import os
 import random
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 from playwright.async_api import (
@@ -66,6 +67,45 @@ class LoginRequiredError(Exception):
     """Raised when Goofish redirects to the passport/mini_login flow."""
 
 
+@dataclass
+class ReusableSearchSession:
+    """保存定时监控可复用的浏览器页面和筛选状态。"""
+
+    filter_signature: Optional[tuple] = None
+    state_file: Optional[str] = None
+    proxy_server: Optional[str] = None
+    last_success_at: Optional[datetime] = None
+    playwright: Optional[Any] = None
+    browser: Optional[Any] = None
+    context: Optional[Any] = None
+    page: Optional[Any] = None
+    search_url: Optional[str] = None
+
+    async def close(self) -> None:
+        """关闭浏览器资源，并清空会话状态，保证下轮从首页冷启动。"""
+        for resource in (self.page, self.context, self.browser):
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except Exception:
+                pass
+        if self.playwright is not None:
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
+        self.filter_signature = None
+        self.state_file = None
+        self.proxy_server = None
+        self.last_success_at = None
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.search_url = None
+
+
 FAILURE_GUARD = FailureGuard()
 EDGE_DOCKER_WARNING_PRINTED = False
 INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
@@ -80,6 +120,52 @@ PROXY_ENV_KEYS = (
     "https_proxy",
     "all_proxy",
 )
+
+
+def _normalize_new_publish_option(task_config: dict) -> str:
+    raw_new_publish = task_config.get("new_publish_option") or ""
+    new_publish_option = str(raw_new_publish).strip()
+    return "" if new_publish_option == "__none__" else new_publish_option
+
+
+def _build_task_filter_signature(task_config: dict) -> tuple:
+    return (
+        str(task_config.get("keyword") or "").strip(),
+        _normalize_new_publish_option(task_config),
+        bool(task_config.get("personal_only", False)),
+        bool(task_config.get("free_shipping", False)),
+        str(task_config.get("region") or "").strip(),
+        str(task_config.get("min_price") or "").strip(),
+        str(task_config.get("max_price") or "").strip(),
+        int(task_config.get("max_pages", 1) or 1),
+    )
+
+
+def _can_reuse_search_session(
+    session: Optional[ReusableSearchSession],
+    task_config: dict,
+    *,
+    state_file: str,
+    proxy_server: Optional[str],
+) -> bool:
+    if session is None or session.last_success_at is None:
+        return False
+    if session.state_file != state_file or session.proxy_server != proxy_server:
+        return False
+    return session.filter_signature == _build_task_filter_signature(task_config)
+
+
+def _has_live_page(session: Optional[ReusableSearchSession]) -> bool:
+    page = session.page if session is not None else None
+    if page is None:
+        return False
+    is_closed = getattr(page, "is_closed", None)
+    if callable(is_closed):
+        try:
+            return not bool(is_closed())
+        except Exception:
+            return False
+    return True
 
 
 def _is_login_url(url: str) -> bool:
@@ -589,7 +675,11 @@ async def scrape_user_profile(context, user_id: str) -> dict:
     return profile_data
 
 
-async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
+async def scrape_xianyu(
+    task_config: dict,
+    debug_limit: int = 0,
+    reusable_session: Optional[ReusableSearchSession] = None,
+):
     """
     【核心执行器】
     根据单个任务配置，异步爬取闲鱼商品数据，并对每个新发现的商品进行实时的、独立的AI分析和通知。
@@ -610,10 +700,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
             for keyword_rule in keyword_rules
         ]
     free_shipping = task_config.get("free_shipping", False)
-    raw_new_publish = task_config.get("new_publish_option") or ""
-    new_publish_option = raw_new_publish.strip()
-    if new_publish_option == "__none__":
-        new_publish_option = ""
+    new_publish_option = _normalize_new_publish_option(task_config)
     is_latest_mode = new_publish_option == "最新"
     region_filter = (task_config.get("region") or "").strip()
 
@@ -701,7 +788,44 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
         except Exception as e:
             print(f"警告：读取登录状态文件失败，将直接按路径使用: {e}")
 
-        async with async_playwright() as p:
+        session_has_live_page = _has_live_page(reusable_session)
+        session_can_reuse_filters = session_has_live_page and _can_reuse_search_session(
+            reusable_session,
+            task_config,
+            state_file=state_file,
+            proxy_server=proxy_server,
+        )
+        session_can_keep_browser = (
+            reusable_session is not None
+            and session_has_live_page
+            and reusable_session.state_file == state_file
+            and reusable_session.proxy_server == proxy_server
+        )
+        keep_session_after_success = reusable_session is not None
+        attempt_success = False
+        page = None
+        context = None
+        browser = None
+        playwright_manager = None
+
+        if session_can_keep_browser:
+            page = reusable_session.page
+            context = reusable_session.context
+            browser = reusable_session.browser
+            playwright_manager = reusable_session.playwright
+        else:
+            if (
+                reusable_session is not None
+                and (
+                    reusable_session.page is not None
+                    or reusable_session.context is not None
+                    or reusable_session.browser is not None
+                    or reusable_session.playwright is not None
+                )
+            ):
+                await reusable_session.close()
+
+            playwright_manager = await async_playwright().start()
             # 反检测启动参数
             launch_args = [
                 "--disable-blink-features=AutomationControlled",
@@ -722,7 +846,7 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
             launch_kwargs["channel"] = _resolve_browser_channel()
 
-            browser = await p.chromium.launch(**launch_kwargs)
+            browser = await playwright_manager.chromium.launch(**launch_kwargs)
 
             context_kwargs = _default_context_options()
             storage_state_arg = state_file
@@ -773,20 +897,62 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
 
             page = await context.new_page()
 
-            try:
-                # 步骤 0 - 模拟真实用户：先访问首页（重要的反检测措施）
-                log_time("步骤 0 - 模拟真实用户访问首页...")
-                await page.goto(
-                    "https://www.goofish.com/",
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-                log_time("[反爬] 在首页停留，模拟浏览...")
-                await random_sleep(1, 2)
+        if reusable_session is not None:
+            reusable_session.state_file = state_file
+            reusable_session.proxy_server = proxy_server
+            reusable_session.playwright = playwright_manager
+            reusable_session.browser = browser
+            reusable_session.context = context
+            reusable_session.page = page
 
-                # 模拟随机滚动（移动设备的触摸滚动）
-                await page.evaluate("window.scrollBy(0, Math.random() * 500 + 200)")
-                await random_sleep(1, 2)
+        try:
+            if session_can_reuse_filters and reusable_session.search_url:
+                log_time("复用已筛选搜索页面，刷新当前结果...")
+                try:
+                    async with page.expect_response(
+                        is_search_results_response,
+                        timeout=INITIAL_SEARCH_RESPONSE_TIMEOUT_MS,
+                    ) as initial_response_info:
+                        await page.goto(
+                            reusable_session.search_url,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                    if _is_login_url(page.url):
+                        raise LoginRequiredError(
+                            f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                        )
+                    initial_response = await initial_response_info.value
+                    final_response = initial_response
+                    log_time("复用页面刷新完成，开始处理商品列表...")
+                except PlaywrightTimeoutError:
+                    await _raise_if_security_challenge(
+                        page, keyword, timeout_ms=1000
+                    )
+                    log_time(
+                        "复用页面等待搜索响应超时，本轮任务跳过，"
+                        "下轮将从首页重新开始。"
+                    )
+                    return 0
+            else:
+                if not session_can_keep_browser:
+                    # 步骤 0 - 模拟真实用户：先访问首页（重要的反检测措施）
+                    log_time("步骤 0 - 模拟真实用户访问首页...")
+                    await page.goto(
+                        "https://www.goofish.com/",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    log_time("[反爬] 在首页停留，模拟浏览...")
+                    await random_sleep(1, 2)
+
+                    # 模拟随机滚动（移动设备的触摸滚动）
+                    await page.evaluate(
+                        "window.scrollBy(0, Math.random() * 500 + 200)"
+                    )
+                    await random_sleep(1, 2)
+                else:
+                    log_time("筛选条件变化，复用浏览器重新进入搜索页...")
 
                 log_time("步骤 1 - 导航到搜索结果页...")
                 # 使用 'q' 参数构建正确的搜索URL，并进行URL编码
@@ -820,13 +986,17 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             raise LoginRequiredError(
                                 f"Login required: redirected to {page.url} (cookies/state likely expired)"
                             )
-                        await _raise_if_security_challenge(page, keyword, timeout_ms=1000)
+                        await _raise_if_security_challenge(
+                            page, keyword, timeout_ms=1000
+                        )
                         if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
                             log_time(
                                 "等待初始搜索响应超时，"
                                 f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
                             )
-                            await asyncio.sleep(INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS)
+                            await asyncio.sleep(
+                                INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS
+                            )
                             continue
                         log_time(
                             "等待初始搜索响应超时，本轮任务跳过，"
@@ -840,16 +1010,26 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                             ) from e
                         if not _is_navigation_aborted_error(e):
                             raise
-                        await _raise_if_security_challenge(page, keyword, timeout_ms=1000)
+                        await _raise_if_security_challenge(
+                            page, keyword, timeout_ms=1000
+                        )
                         if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
                             log_time(
                                 "初始搜索页导航被浏览器取消(net::ERR_ABORTED)，"
                                 f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
                             )
-                            await asyncio.sleep(INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS)
+                            await asyncio.sleep(
+                                INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS
+                            )
                             continue
                         raise
 
+            filters_already_applied = bool(
+                session_can_reuse_filters
+                and reusable_session is not None
+                and reusable_session.search_url
+            )
+            if not filters_already_applied:
                 # 等待页面加载出关键筛选元素，以确认已成功进入搜索结果页
                 try:
                     await page.wait_for_selector("text=新发布", timeout=15000)
@@ -1102,135 +1282,163 @@ async def scrape_xianyu(task_config: dict, debug_limit: int = 0):
                     except Exception as e:
                         print(f"LOG: 应用价格筛选失败: {e}")
 
-                log_time("所有筛选已完成，开始处理商品列表...")
+            log_time("所有筛选已完成，开始处理商品列表...")
 
-                current_response = (
-                    final_response
-                    if final_response and final_response.ok
-                    else initial_response
+            reusable_search_url = (
+                reusable_session.search_url
+                if filters_already_applied and reusable_session is not None
+                else page.url
+            )
+            current_response = (
+                final_response
+                if final_response and final_response.ok
+                else initial_response
+            )
+            for page_num in range(1, max_pages + 1):
+                if stop_scraping:
+                    break
+                log_time(f"开始处理第 {page_num}/{max_pages} 页 ...")
+
+                if page_num > 1:
+                    page_advance_result = await advance_search_page(
+                        page=page,
+                        page_num=page_num,
+                    )
+                    if not page_advance_result.advanced:
+                        break
+                    current_response = page_advance_result.response
+
+                if not (current_response and current_response.ok):
+                    log_time(f"第 {page_num} 页响应无效，跳过。")
+                    continue
+
+                basic_items = await _parse_search_results_json(
+                    await current_response.json(), f"第 {page_num} 页"
                 )
-                for page_num in range(1, max_pages + 1):
-                    if stop_scraping:
-                        break
-                    log_time(f"开始处理第 {page_num}/{max_pages} 页 ...")
-
-                    if page_num > 1:
-                        page_advance_result = await advance_search_page(
-                            page=page,
-                            page_num=page_num,
-                        )
-                        if not page_advance_result.advanced:
-                            break
-                        current_response = page_advance_result.response
-
-                    if not (current_response and current_response.ok):
-                        log_time(f"第 {page_num} 页响应无效，跳过。")
-                        continue
-
-                    basic_items = await _parse_search_results_json(
-                        await current_response.json(), f"第 {page_num} 页"
+                if not basic_items:
+                    break
+                previous_snapshots = list(historical_snapshots)
+                historical_snapshots.extend(
+                    record_market_snapshots(
+                        keyword=keyword,
+                        task_name=task_config.get("task_name", "Untitled Task"),
+                        items=basic_items,
+                        run_id=history_run_id,
+                        snapshot_time=datetime.now().isoformat(),
+                        seen_item_ids=history_seen_item_ids,
                     )
-                    if not basic_items:
-                        break
-                    previous_snapshots = list(historical_snapshots)
-                    historical_snapshots.extend(
-                        record_market_snapshots(
-                            keyword=keyword,
-                            task_name=task_config.get("task_name", "Untitled Task"),
-                            items=basic_items,
-                            run_id=history_run_id,
-                            snapshot_time=datetime.now().isoformat(),
-                            seen_item_ids=history_seen_item_ids,
-                        )
-                    )
+                )
 
-                    total_items_on_page = len(basic_items)
-                    for i, item_data in enumerate(basic_items, 1):
-                        if debug_limit > 0 and processed_item_count >= debug_limit:
+                total_items_on_page = len(basic_items)
+                for i, item_data in enumerate(basic_items, 1):
+                    if debug_limit > 0 and processed_item_count >= debug_limit:
+                        log_time(
+                            f"已达到调试上限 ({debug_limit})，停止获取新商品。"
+                        )
+                        stop_scraping = True
+                        break
+
+                    unique_key = get_link_unique_key(item_data["商品链接"])
+                    if unique_key in processed_links:
+                        notified_drop = await _notify_duplicate_price_drop_if_needed(
+                            item_data=item_data,
+                            previous_snapshots=previous_snapshots,
+                            keyword_rules=keyword_rules,
+                            keyword_alert_rules=keyword_alert_rules,
+                            decision_mode=decision_mode,
+                        )
+                        log_time(
+                            f"[页内进度 {i}/{total_items_on_page}] 商品 '{item_data['商品标题'][:20]}...' 已存在，"
+                            f"{'已发送降价提醒。' if notified_drop else '跳过。'}"
+                        )
+                        if is_latest_mode:
                             log_time(
-                                f"已达到调试上限 ({debug_limit})，停止获取新商品。"
+                                "最新模式遇到历史商品，停止继续同步，"
+                                "不再拉取后续详情或分页。"
                             )
                             stop_scraping = True
                             break
+                        continue
 
-                        unique_key = get_link_unique_key(item_data["商品链接"])
-                        if unique_key in processed_links:
-                            notified_drop = await _notify_duplicate_price_drop_if_needed(
-                                item_data=item_data,
-                                previous_snapshots=previous_snapshots,
-                                keyword_rules=keyword_rules,
-                                keyword_alert_rules=keyword_alert_rules,
-                                decision_mode=decision_mode,
-                            )
-                            log_time(
-                                f"[页内进度 {i}/{total_items_on_page}] 商品 '{item_data['商品标题'][:20]}...' 已存在，"
-                                f"{'已发送降价提醒。' if notified_drop else '跳过。'}"
-                            )
-                            if is_latest_mode:
-                                log_time(
-                                    "最新模式遇到历史商品，停止继续同步，"
-                                    "不再拉取后续详情或分页。"
-                                )
-                                stop_scraping = True
-                                break
-                            continue
-
+                    log_time(
+                        f"[页内进度 {i}/{total_items_on_page}] 发现新商品，保存并通知: {item_data['商品标题'][:30]}..."
+                    )
+                    final_record = _build_search_list_result_record(
+                        item_data=item_data,
+                        keyword=keyword,
+                        task_name=task_config.get("task_name", "Untitled Task"),
+                    )
+                    if await save_to_jsonl(final_record, keyword):
+                        processed_links.add(unique_key)
+                        processed_item_count += 1
                         log_time(
-                            f"[页内进度 {i}/{total_items_on_page}] 发现新商品，保存并通知: {item_data['商品标题'][:30]}..."
+                            f"商品已保存。累计处理 {processed_item_count} 个新商品。"
                         )
-                        final_record = _build_search_list_result_record(
-                            item_data=item_data,
-                            keyword=keyword,
-                            task_name=task_config.get("task_name", "Untitled Task"),
-                        )
-                        if await save_to_jsonl(final_record, keyword):
-                            processed_links.add(unique_key)
-                            processed_item_count += 1
-                            log_time(
-                                f"商品已保存。累计处理 {processed_item_count} 个新商品。"
+                        try:
+                            await send_ntfy_notification(
+                                item_data, QUICK_NOTIFY_REASON
                             )
-                            try:
-                                await send_ntfy_notification(
-                                    item_data, QUICK_NOTIFY_REASON
-                                )
-                            except Exception as e:
-                                print(f"   [通知] 发送失败: {e}")
-                        else:
-                            print("   错误: 保存搜索列表基础记录失败，跳过通知。")
+                        except Exception as e:
+                            print(f"   [通知] 发送失败: {e}")
+                    else:
+                        print("   错误: 保存搜索列表基础记录失败，跳过通知。")
 
-                    # --- 新增: 在处理完一页所有商品后，翻页前，增加一个更长的“休息”时间 ---
-                    if not stop_scraping and page_num < max_pages:
-                        print(
-                            f"--- 第 {page_num} 页处理完毕，准备翻页。执行一次页面间的长时休息... ---"
-                        )
-                        await random_sleep(10, 15)
+                # --- 新增: 在处理完一页所有商品后，翻页前，增加一个更长的“休息”时间 ---
+                if not stop_scraping and page_num < max_pages:
+                    print(
+                        f"--- 第 {page_num} 页处理完毕，准备翻页。执行一次页面间的长时休息... ---"
+                    )
+                    await random_sleep(10, 15)
 
-            except PlaywrightTimeoutError as e:
-                if _is_login_url(page.url):
-                    raise LoginRequiredError(
-                        f"Login required: redirected to {page.url} (cookies/state likely expired)"
-                    ) from e
-                print(f"\n操作超时错误: 页面元素或网络响应未在规定时间内出现。\n{e}")
-                raise
-            except asyncio.CancelledError:
-                log_time("收到取消信号，正在终止当前爬虫任务...")
-                raise
-            except Exception as e:
-                if type(e).__name__ == "TargetClosedError":
-                    log_time("浏览器已关闭，忽略后续异常（可能是任务被停止）。")
-                    return processed_item_count
-                if "passport.goofish.com" in str(e):
-                    raise LoginRequiredError(
-                        f"Login required: redirected to passport flow ({e})"
-                    ) from e
-                print(f"\n爬取过程中发生未知错误: {e}")
-                raise
-            finally:
+            if keep_session_after_success and reusable_session is not None:
+                reusable_session.filter_signature = _build_task_filter_signature(
+                    task_config
+                )
+                reusable_session.state_file = state_file
+                reusable_session.proxy_server = proxy_server
+                reusable_session.last_success_at = datetime.now()
+                reusable_session.playwright = playwright_manager
+                reusable_session.browser = browser
+                reusable_session.context = context
+                reusable_session.page = page
+                reusable_session.search_url = reusable_search_url
+            attempt_success = True
+
+        except PlaywrightTimeoutError as e:
+            if _is_login_url(page.url):
+                raise LoginRequiredError(
+                    f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                ) from e
+            print(f"\n操作超时错误: 页面元素或网络响应未在规定时间内出现。\n{e}")
+            raise
+        except asyncio.CancelledError:
+            log_time("收到取消信号，正在终止当前爬虫任务...")
+            raise
+        except Exception as e:
+            if type(e).__name__ == "TargetClosedError":
+                log_time("浏览器已关闭，忽略后续异常（可能是任务被停止）。")
+                return processed_item_count
+            if "passport.goofish.com" in str(e):
+                raise LoginRequiredError(
+                    f"Login required: redirected to passport flow ({e})"
+                ) from e
+            print(f"\n爬取过程中发生未知错误: {e}")
+            raise
+        finally:
+            if keep_session_after_success and attempt_success:
+                log_time("任务执行完毕，页面已保留供下轮定时同步复用。")
+            else:
                 log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
                 await asyncio.sleep(5)
                 if debug_limit:
                     input("按回车键关闭浏览器...")
-                await browser.close()
+                if reusable_session is not None:
+                    await reusable_session.close()
+                else:
+                    if browser is not None:
+                        await browser.close()
+                    if playwright_manager is not None:
+                        await playwright_manager.stop()
 
         return processed_item_count
 
