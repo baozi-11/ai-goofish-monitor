@@ -181,6 +181,9 @@ def test_build_search_request_template_from_response_keeps_confirmed_request():
         headers={
             "content-type": "application/x-www-form-urlencoded",
             "accept": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "accept-encoding": "zstd, br, gzip",
+            "user-agent": "Mozilla/5.0",
             ":authority": "h5api.m.goofish.com",
             ":method": "POST",
             ":path": "/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
@@ -206,6 +209,8 @@ def test_build_search_request_template_from_response_keeps_confirmed_request():
     assert template.headers == {
         "content-type": "application/x-www-form-urlencoded",
         "accept": "application/json",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "user-agent": "Mozilla/5.0",
     }
 
 
@@ -223,32 +228,41 @@ def test_search_request_template_rejects_missing_publish_sort():
 
 
 class _FakeApiResponse:
-    def __init__(self, ok=True):
+    def __init__(self, ok=True, json_error=None, body=b"\xb5bad", headers=None):
         self.ok = ok
         self.status = 200 if ok else 500
         self.url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/"
+        self._json_error = json_error
+        self._body = body
+        self.headers = headers or {}
 
     async def json(self):
+        if self._json_error is not None:
+            raise self._json_error
         return {"data": {"resultList": []}}
+
+    async def body(self):
+        return self._body
 
 
 class _FakeRequestContext:
-    def __init__(self):
+    def __init__(self, api_response=None):
         self.post_calls = []
+        self.api_response = api_response or _FakeApiResponse(ok=True)
 
     async def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
-        return _FakeApiResponse(ok=True)
+        return self.api_response
 
 
 class _FakeBrowserContext:
-    def __init__(self):
-        self.request = _FakeRequestContext()
+    def __init__(self, api_response=None):
+        self.request = _FakeRequestContext(api_response=api_response)
 
 
 class _FakeReplayPage:
-    def __init__(self):
-        self.context = _FakeBrowserContext()
+    def __init__(self, api_response=None):
+        self.context = _FakeBrowserContext(api_response=api_response)
 
 
 def test_replay_search_request_uses_saved_template_without_dom():
@@ -284,11 +298,55 @@ def test_replay_search_request_uses_saved_template_without_dom():
             template.url,
             {
                 "data": template.post_data,
-                "headers": template.headers,
+                "headers": {
+                    "content-type": "application/x-www-form-urlencoded",
+                    "accept": "application/json, text/plain, */*",
+                },
                 "timeout": 20000,
             },
         )
     ]
+
+
+def test_replay_search_request_reports_non_json_response_details():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    template = SearchRequestTemplate(
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option="最新",
+    )
+    session = ReusableSearchSession(
+        filter_signature=_build_task_filter_signature(task_config),
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        last_success_at=datetime(2026, 7, 22, 14, 57, 31),
+        search_request_template=template,
+    )
+    page = _FakeReplayPage(
+        api_response=_FakeApiResponse(
+            ok=True,
+            json_error=UnicodeDecodeError("utf-8", b"\xb5bad", 0, 1, "invalid"),
+            body=b"\xb5bad",
+            headers={"content-type": "application/octet-stream"},
+        )
+    )
+
+    try:
+        asyncio.run(
+            _replay_search_request_from_session(
+                page=page,
+                session=session,
+                task_config=task_config,
+                timeout_ms=20000,
+            )
+        )
+    except Exception as exc:
+        assert "content-type=application/octet-stream" in str(exc)
+        assert "body_hex=b5626164" in str(exc)
+    else:
+        raise AssertionError("expected replay failure with response diagnostics")
 
 
 def test_select_search_response_requires_filter_response_when_publish_filter_configured():

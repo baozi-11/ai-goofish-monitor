@@ -159,6 +159,16 @@ PROXY_ENV_KEYS = (
     "all_proxy",
 )
 HTTP_HEADER_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+SEARCH_REPLAY_HEADER_ALLOWLIST = {
+    "content-type",
+    "accept",
+    "accept-language",
+    "user-agent",
+}
+SEARCH_REPLAY_DEFAULT_HEADERS = {
+    "content-type": "application/x-www-form-urlencoded",
+    "accept": "application/json, text/plain, */*",
+}
 
 
 def _normalize_new_publish_option(task_config: dict) -> str:
@@ -335,7 +345,7 @@ def _can_replay_search_request(
 
 
 def _sanitize_search_request_headers(headers: Optional[dict]) -> dict:
-    """保留 replay 所需的普通请求头，去掉容易过期或由浏览器上下文托管的头。"""
+    """保留 replay 所需白名单请求头，避免压缩/伪头导致 API 请求失败。"""
     if not isinstance(headers, dict):
         return {}
     excluded = {
@@ -350,12 +360,22 @@ def _sanitize_search_request_headers(headers: Optional[dict]) -> dict:
         header_name: str(value)
         for key, value in headers.items()
         for header_name in [str(key)]
+        for header_key in [header_name.lower()]
         if value is not None
         and header_name
         and not header_name.startswith(":")
-        and header_name.lower() not in excluded
+        and header_key not in excluded
+        and header_key in SEARCH_REPLAY_HEADER_ALLOWLIST
         and HTTP_HEADER_TOKEN_RE.match(header_name)
     }
+
+
+def _build_replay_request_headers(template: SearchRequestTemplate) -> dict:
+    """为复用请求补齐稳定默认头，并继续避免浏览器压缩头进入 replay。"""
+    headers = dict(SEARCH_REPLAY_DEFAULT_HEADERS)
+    headers.update(_sanitize_search_request_headers(template.headers))
+    headers.pop("accept-encoding", None)
+    return headers
 
 
 async def _build_search_request_template_from_response(
@@ -409,6 +429,24 @@ class _ReplaySearchResponse:
             self._json_cache = await self._api_response.json()
         return self._json_cache
 
+    async def diagnostic_summary(self, max_bytes: int = 120) -> str:
+        headers = getattr(self._api_response, "headers", {}) or {}
+        content_type = "-"
+        if isinstance(headers, dict):
+            content_type = headers.get("content-type") or headers.get("Content-Type") or "-"
+        body_hex = "-"
+        body = getattr(self._api_response, "body", None)
+        if callable(body):
+            try:
+                body_bytes = await body()
+                if isinstance(body_bytes, bytes):
+                    body_hex = body_bytes[:max_bytes].hex()
+                else:
+                    body_hex = str(body_bytes)[:max_bytes].encode("utf-8").hex()
+            except Exception as exc:
+                body_hex = f"unavailable:{exc}"
+        return f"status={self.status}, content-type={content_type}, body_hex={body_hex}"
+
 
 async def _replay_search_request_from_session(
     *,
@@ -428,7 +466,7 @@ async def _replay_search_request_from_session(
         api_response = await request_context.post(
             template.url,
             data=template.post_data,
-            headers=template.headers,
+            headers=_build_replay_request_headers(template),
             timeout=timeout_ms,
         )
     except PlaywrightTimeoutError as exc:
@@ -443,7 +481,10 @@ async def _replay_search_request_from_session(
     try:
         await replay_response.json()
     except Exception as exc:
-        raise SearchRequestReplayError(f"复用筛选接口返回非 JSON 数据: {exc}") from exc
+        diagnostics = await replay_response.diagnostic_summary()
+        raise SearchRequestReplayError(
+            f"复用筛选接口返回非 JSON 数据: {exc}; {diagnostics}"
+        ) from exc
     return replay_response
 
 
