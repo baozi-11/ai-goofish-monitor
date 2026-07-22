@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -157,6 +158,7 @@ PROXY_ENV_KEYS = (
     "https_proxy",
     "all_proxy",
 )
+HTTP_HEADER_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 def _normalize_new_publish_option(task_config: dict) -> str:
@@ -345,9 +347,14 @@ def _sanitize_search_request_headers(headers: Optional[dict]) -> dict:
         "connection",
     }
     return {
-        str(key): str(value)
+        header_name: str(value)
         for key, value in headers.items()
-        if str(key).lower() not in excluded and value is not None
+        for header_name in [str(key)]
+        if value is not None
+        and header_name
+        and not header_name.startswith(":")
+        and header_name.lower() not in excluded
+        and HTTP_HEADER_TOKEN_RE.match(header_name)
     }
 
 

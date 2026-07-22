@@ -180,6 +180,12 @@ def test_build_search_request_template_from_response_keeps_confirmed_request():
         post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
         headers={
             "content-type": "application/x-www-form-urlencoded",
+            "accept": "application/json",
+            ":authority": "h5api.m.goofish.com",
+            ":method": "POST",
+            ":path": "/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+            ":scheme": "https",
+            "bad header": "invalid",
             "cookie": "redacted",
             "content-length": "123",
         },
@@ -197,7 +203,10 @@ def test_build_search_request_template_from_response_keeps_confirmed_request():
     assert template.post_data == response.request.post_data
     assert template.filter_signature == _build_task_filter_signature(task_config)
     assert template.new_publish_option == "最新"
-    assert template.headers == {"content-type": "application/x-www-form-urlencoded"}
+    assert template.headers == {
+        "content-type": "application/x-www-form-urlencoded",
+        "accept": "application/json",
+    }
 
 
 def test_search_request_template_rejects_missing_publish_sort():
