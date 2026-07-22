@@ -6,15 +6,19 @@ from src.scraper import (
     NEW_PUBLISH_POPUP_SELECTOR,
     NewPublishOptionNotFoundError,
     NewPublishPopupNotFoundError,
+    LoginRequiredError,
     PlaywrightTimeoutError,
     _build_task_filter_signature,
     _can_reuse_search_session,
     _click_new_publish_option_in_open_filter,
     _capture_search_response_after_action,
     _find_new_publish_option_in_open_filter,
+    _is_login_modal_visible,
     _open_new_publish_filter,
+    _retain_successful_search_session,
     _requires_confirmed_filter_response,
     _search_response_stage_for_log,
+    _should_reuse_current_search_page,
     _select_latest_ok_search_response,
     _select_search_response_for_processing,
 )
@@ -46,7 +50,7 @@ def test_can_reuse_search_session_when_successful_session_matches_filters():
     ) is True
 
 
-def test_can_reuse_search_session_rejects_filter_changes():
+def test_can_reuse_search_session_allows_filter_changes_for_rescreening():
     session = ReusableSearchSession(
         filter_signature=_build_task_filter_signature(
             {"keyword": "dim十字绣", "new_publish_option": "最新"}
@@ -61,6 +65,53 @@ def test_can_reuse_search_session_rejects_filter_changes():
         {"keyword": "dim十字绣", "new_publish_option": "1天内"},
         state_file="state/baozi-175.json",
         proxy_server=None,
+    ) is True
+
+
+def test_retain_successful_search_session_marks_zero_new_item_sync_success():
+    session = ReusableSearchSession()
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    page = object()
+    context = object()
+    browser = object()
+    playwright = object()
+
+    _retain_successful_search_session(
+        session=session,
+        task_config=task_config,
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        playwright=playwright,
+        browser=browser,
+        context=context,
+        page=page,
+    )
+
+    assert session.filter_signature == _build_task_filter_signature(task_config)
+    assert session.state_file == "state/baozi-166.json"
+    assert session.proxy_server is None
+    assert session.last_success_at is not None
+    assert session.playwright is playwright
+    assert session.browser is browser
+    assert session.context is context
+    assert session.page is page
+
+
+def test_should_reuse_current_search_page_when_publish_filter_exists():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+
+    assert _should_reuse_current_search_page(
+        session_can_keep_browser=True,
+        task_config=task_config,
+    ) is True
+
+
+def test_should_not_reuse_current_search_page_without_publish_filter():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": ""}
+
+    assert _should_reuse_current_search_page(
+        session_can_keep_browser=True,
+        task_config=task_config,
     ) is False
 
 
@@ -171,11 +222,19 @@ def test_select_latest_ok_search_response_uses_last_successful_response():
 
 
 class _FakeLocator:
-    def __init__(self, page, name: str, count: int = 1, visible: bool = True):
+    def __init__(
+        self,
+        page,
+        name: str,
+        count: int = 1,
+        visible: bool = True,
+        click_error=None,
+    ):
         self.page = page
         self.name = name
         self._count = count
         self.visible = visible
+        self.click_error = click_error
         self.clicks = 0
         self.wait_calls = []
         self.first = self
@@ -186,6 +245,8 @@ class _FakeLocator:
 
     async def click(self):
         self.clicks += 1
+        if self.click_error is not None:
+            raise self.click_error
 
     async def is_visible(self):
         return self.visible
@@ -211,6 +272,7 @@ class _FakePage:
         self.trigger_locator = _FakeLocator(self, "trigger")
         self.popup_locator = _FakeLocator(self, "popup")
         self.content_menu_locator = _FakeLocator(self, "content-menu")
+        self.login_modal_locator = _FakeLocator(self, "login-modal", count=0)
         self.empty_locator = _FakeLocator(self, "empty", count=0)
         self.option_locators = {
             "最新": _FakeLocator(self, "option:最新"),
@@ -235,6 +297,8 @@ class _FakePage:
 
     def locator(self, selector: str):
         self.locator_calls.append(selector)
+        if "login-modal-wrap" in selector:
+            return self.login_modal_locator
         if "data-goofish-new-publish-menu" in selector:
             return self.content_menu_locator
         return self.popup_locator
@@ -259,6 +323,30 @@ def test_click_new_publish_option_uses_scoped_popup_locator():
     assert page.locator_text_calls == [("popup", "最新", True)]
     assert page.option_locators["最新"].clicks == 1
     assert page.page_clicks == []
+
+
+def test_open_new_publish_filter_raises_login_required_when_modal_blocks_click():
+    page = _FakePage()
+    page.trigger_locator.click_error = PlaywrightTimeoutError(
+        "login-modal-wrap intercepts pointer events"
+    )
+    page.login_modal_locator._count = 1
+    page.login_modal_locator.visible = True
+
+    try:
+        asyncio.run(_open_new_publish_filter(page))
+    except LoginRequiredError as exc:
+        assert "login modal" in str(exc)
+    else:
+        raise AssertionError("expected LoginRequiredError")
+
+
+def test_is_login_modal_visible_detects_visible_login_overlay():
+    page = _FakePage()
+    page.login_modal_locator._count = 1
+    page.login_modal_locator.visible = True
+
+    assert asyncio.run(_is_login_modal_visible(page)) is True
 
 
 def test_click_new_publish_option_uses_task_configured_option():

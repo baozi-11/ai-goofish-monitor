@@ -172,11 +172,43 @@ def _can_reuse_search_session(
         return False
     if session.state_file != state_file or session.proxy_server != proxy_server:
         return False
-    return session.filter_signature == _build_task_filter_signature(task_config)
+    return True
+
+
+def _retain_successful_search_session(
+    *,
+    session: ReusableSearchSession,
+    task_config: dict,
+    state_file: str,
+    proxy_server: Optional[str],
+    playwright: Optional[Any],
+    browser: Optional[Any],
+    context: Optional[Any],
+    page: Optional[Any],
+) -> None:
+    """记录一次完整筛选同步成功后的浏览器会话，供下一轮定时任务复用。"""
+    session.filter_signature = _build_task_filter_signature(task_config)
+    session.state_file = state_file
+    session.proxy_server = proxy_server
+    session.last_success_at = datetime.now()
+    session.playwright = playwright
+    session.browser = browser
+    session.context = context
+    session.page = page
+    session.search_url = None
 
 
 def _requires_confirmed_filter_response(task_config: dict) -> bool:
     return bool(_normalize_new_publish_option(task_config))
+
+
+def _should_reuse_current_search_page(
+    *,
+    session_can_keep_browser: bool,
+    task_config: dict,
+) -> bool:
+    """判断本轮是否直接复用当前搜索页，避免重复导航触发初始接口超时。"""
+    return bool(session_can_keep_browser and _normalize_new_publish_option(task_config))
 
 
 def _select_search_response_for_processing(
@@ -339,7 +371,23 @@ async def _open_new_publish_filter(page: Any) -> None:
             return
         await page.click("text=新发布")
     except PlaywrightTimeoutError as e:
+        if await _is_login_modal_visible(page):
+            raise LoginRequiredError(
+                "Login required: login modal blocks new publish filter click"
+            ) from e
         raise NewPublishPopupNotFoundError("新发布筛选入口未找到") from e
+
+
+async def _is_login_modal_visible(page: Any) -> bool:
+    """识别闲鱼页面层登录弹窗，避免把登录态失效误报成筛选入口缺失。"""
+    login_modal = page.locator(
+        ".login-modal-wrap, div[class*='login-modal-wrap'], "
+        ".ant-modal-wrap[class*='login-modal-wrap']"
+    ).first
+    try:
+        return bool(await login_modal.count()) and bool(await login_modal.is_visible())
+    except Exception:
+        return False
 
 
 async def _first_visible_locator(locator: Any, max_candidates: int = 20) -> Optional[Any]:
@@ -1168,6 +1216,7 @@ async def scrape_xianyu(
         )
         keep_session_after_success = reusable_session is not None
         attempt_success = False
+        close_session_reason = "本轮未完成筛选同步"
         page = None
         context = None
         browser = None
@@ -1270,6 +1319,11 @@ async def scrape_xianyu(
             reusable_session.context = context
             reusable_session.page = page
 
+        reuse_current_search_page = _should_reuse_current_search_page(
+            session_can_keep_browser=session_can_keep_browser,
+            task_config=task_config,
+        )
+
         try:
             if not session_can_keep_browser:
                 # 步骤 0 - 模拟真实用户：先访问首页（重要的反检测措施）
@@ -1288,78 +1342,86 @@ async def scrape_xianyu(
                 )
                 await random_sleep(1, 2)
             else:
-                log_time("复用浏览器跳过首页，重新查询并应用筛选...")
+                if reuse_current_search_page:
+                    log_time("复用浏览器跳过首页，直接在当前搜索页重新应用筛选...")
+                else:
+                    log_time("复用浏览器跳过首页，重新查询并应用筛选...")
 
-            log_time("步骤 1 - 导航到搜索结果页...")
             # 使用 'q' 参数构建正确的搜索URL，并进行URL编码
             params = {"q": keyword}
             search_url = f"https://www.goofish.com/search?{urlencode(params)}"
-            log_time(f"目标URL: {search_url}")
 
             initial_response = None
-            for retry_index in range(INITIAL_SEARCH_RESPONSE_RETRY_COUNT):
-                try:
-                    # 先监听搜索接口响应，再执行导航，避免错过首次请求
-                    async with page.expect_response(
-                        is_search_results_response,
-                        timeout=INITIAL_SEARCH_RESPONSE_TIMEOUT_MS,
-                    ) as initial_response_info:
-                        await page.goto(
-                            search_url,
-                            wait_until="domcontentloaded",
-                            timeout=60000,
-                        )
-                    if _is_login_url(page.url):
-                        raise LoginRequiredError(
-                            f"Login required: redirected to {page.url} (cookies/state likely expired)"
-                        )
+            if reuse_current_search_page:
+                log_time("步骤 1 - 复用当前搜索页，跳过搜索页导航。")
+                log_time(f"当前页面URL: {page.url}")
+            else:
+                log_time("步骤 1 - 导航到搜索结果页...")
+                log_time(f"目标URL: {search_url}")
+                for retry_index in range(INITIAL_SEARCH_RESPONSE_RETRY_COUNT):
+                    try:
+                        # 先监听搜索接口响应，再执行导航，避免错过首次请求
+                        async with page.expect_response(
+                            is_search_results_response,
+                            timeout=INITIAL_SEARCH_RESPONSE_TIMEOUT_MS,
+                        ) as initial_response_info:
+                            await page.goto(
+                                search_url,
+                                wait_until="domcontentloaded",
+                                timeout=60000,
+                            )
+                        if _is_login_url(page.url):
+                            raise LoginRequiredError(
+                                f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                            )
 
-                    # 捕获初始搜索的API数据
-                    initial_response = await initial_response_info.value
-                    _log_search_response_trace("initial", initial_response)
-                    break
-                except PlaywrightTimeoutError:
-                    if _is_login_url(page.url):
-                        raise LoginRequiredError(
-                            f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                        # 捕获初始搜索的API数据
+                        initial_response = await initial_response_info.value
+                        _log_search_response_trace("initial", initial_response)
+                        break
+                    except PlaywrightTimeoutError:
+                        if _is_login_url(page.url):
+                            raise LoginRequiredError(
+                                f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                            )
+                        await _raise_if_security_challenge(
+                            page, keyword, timeout_ms=1000
                         )
-                    await _raise_if_security_challenge(
-                        page, keyword, timeout_ms=1000
-                    )
-                    if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
+                        if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
+                            log_time(
+                                "等待初始搜索响应超时，"
+                                f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
+                            )
+                            await asyncio.sleep(
+                                INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS
+                            )
+                            continue
                         log_time(
-                            "等待初始搜索响应超时，"
-                            f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
+                            "等待初始搜索响应超时，本轮任务跳过，"
+                            "不计为失败保护。"
                         )
-                        await asyncio.sleep(
-                            INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS
+                        close_session_reason = "等待初始搜索响应超时，关闭复用会话"
+                        return 0
+                    except PlaywrightError as e:
+                        if _is_login_url(page.url):
+                            raise LoginRequiredError(
+                                f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                            ) from e
+                        if not _is_navigation_aborted_error(e):
+                            raise
+                        await _raise_if_security_challenge(
+                            page, keyword, timeout_ms=1000
                         )
-                        continue
-                    log_time(
-                        "等待初始搜索响应超时，本轮任务跳过，"
-                        "不计为失败保护。"
-                    )
-                    return 0
-                except PlaywrightError as e:
-                    if _is_login_url(page.url):
-                        raise LoginRequiredError(
-                            f"Login required: redirected to {page.url} (cookies/state likely expired)"
-                        ) from e
-                    if not _is_navigation_aborted_error(e):
+                        if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
+                            log_time(
+                                "初始搜索页导航被浏览器取消(net::ERR_ABORTED)，"
+                                f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
+                            )
+                            await asyncio.sleep(
+                                INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS
+                            )
+                            continue
                         raise
-                    await _raise_if_security_challenge(
-                        page, keyword, timeout_ms=1000
-                    )
-                    if retry_index < INITIAL_SEARCH_RESPONSE_RETRY_COUNT - 1:
-                        log_time(
-                            "初始搜索页导航被浏览器取消(net::ERR_ABORTED)，"
-                            f"{INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS}秒后重试..."
-                        )
-                        await asyncio.sleep(
-                            INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS
-                        )
-                        continue
-                    raise
 
             # 等待页面加载出关键筛选元素，以确认已成功进入搜索结果页
             try:
@@ -1460,16 +1522,24 @@ async def scrape_xianyu(
                         "new_publish",
                         new_publish_response,
                     )
+                except LoginRequiredError:
+                    close_session_reason = "登录弹窗遮挡新发布筛选，关闭复用会话"
+                    raise
                 except NewPublishPopupNotFoundError as e:
+                    close_session_reason = f"{e}，关闭复用会话"
                     log_time(
                         f"{e}，无法应用新发布筛选 '{new_publish_option}'，"
                         "本轮跳过并关闭复用会话。"
                     )
                     return 0
                 except NewPublishOptionNotFoundError as e:
+                    close_session_reason = f"{e}，关闭复用会话"
                     log_time(f"{e}，本轮跳过并关闭复用会话。")
                     return 0
                 except PlaywrightTimeoutError:
+                    close_session_reason = (
+                        f"新发布筛选 '{new_publish_option}' 接口响应超时，关闭复用会话"
+                    )
                     log_time(
                         f"新发布筛选 '{new_publish_option}' 接口响应超时(20秒)，"
                         "本轮跳过并关闭复用会话。"
@@ -1669,6 +1739,7 @@ async def scrape_xianyu(
             )
             log_time(f"搜索响应诊断[selected]: stage={selected_response_stage}")
             if current_response is None:
+                close_session_reason = "筛选响应未确认或不可信，关闭复用会话"
                 log_time(
                     "已配置新发布筛选，但未获得筛选后的搜索响应，"
                     "本轮跳过并关闭复用会话。"
@@ -1771,20 +1842,21 @@ async def scrape_xianyu(
                     await random_sleep(10, 15)
 
             if keep_session_after_success and reusable_session is not None:
-                reusable_session.filter_signature = _build_task_filter_signature(
-                    task_config
+                _retain_successful_search_session(
+                    session=reusable_session,
+                    task_config=task_config,
+                    state_file=state_file,
+                    proxy_server=proxy_server,
+                    playwright=playwright_manager,
+                    browser=browser,
+                    context=context,
+                    page=page,
                 )
-                reusable_session.state_file = state_file
-                reusable_session.proxy_server = proxy_server
-                reusable_session.last_success_at = datetime.now()
-                reusable_session.playwright = playwright_manager
-                reusable_session.browser = browser
-                reusable_session.context = context
-                reusable_session.page = page
-                reusable_session.search_url = None
             attempt_success = True
+            close_session_reason = ""
 
         except PlaywrightTimeoutError as e:
+            close_session_reason = "页面元素或网络响应超时，关闭复用会话"
             if _is_login_url(page.url):
                 raise LoginRequiredError(
                     f"Login required: redirected to {page.url} (cookies/state likely expired)"
@@ -1792,22 +1864,28 @@ async def scrape_xianyu(
             print(f"\n操作超时错误: 页面元素或网络响应未在规定时间内出现。\n{e}")
             raise
         except asyncio.CancelledError:
+            close_session_reason = "任务被取消，关闭复用会话"
             log_time("收到取消信号，正在终止当前爬虫任务...")
             raise
         except Exception as e:
             if type(e).__name__ == "TargetClosedError":
+                close_session_reason = "浏览器页面已关闭，关闭复用会话"
                 log_time("浏览器已关闭，忽略后续异常（可能是任务被停止）。")
                 return processed_item_count
             if "passport.goofish.com" in str(e):
+                close_session_reason = "跳转登录流程，关闭复用会话"
                 raise LoginRequiredError(
                     f"Login required: redirected to passport flow ({e})"
                 ) from e
+            close_session_reason = f"爬取过程异常，关闭复用会话: {e}"
             print(f"\n爬取过程中发生未知错误: {e}")
             raise
         finally:
             if keep_session_after_success and attempt_success:
-                log_time("任务执行完毕，页面已保留供下轮定时同步复用。")
+                log_time("本轮筛选同步成功，页面已保留供下轮复用。")
             else:
+                if reusable_session is not None and close_session_reason:
+                    log_time(close_session_reason)
                 log_time("任务执行完毕，浏览器将在5秒后自动关闭...")
                 await asyncio.sleep(5)
                 if debug_limit:
