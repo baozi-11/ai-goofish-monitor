@@ -23,6 +23,50 @@ def test_parse_search_results(load_json_fixture):
     assert item["商品图片列表"] == [item["商品主图链接"]]
 
 
+def test_parse_search_results_reports_missing_result_list(capsys):
+    items = asyncio.run(
+        _parse_search_results_json(
+            {"ret": ["FAIL_SYS_TOKEN_EXOIRED::令牌过期"], "data": {}},
+            source="search",
+        )
+    )
+
+    captured = capsys.readouterr()
+
+    assert items == []
+    assert "搜索响应结构异常" in captured.out
+    assert "resultList" in captured.out
+
+
+def test_parse_search_results_allows_empty_result_list(capsys):
+    items = asyncio.run(
+        _parse_search_results_json(
+            {"data": {"resultList": []}},
+            source="search",
+        )
+    )
+
+    captured = capsys.readouterr()
+
+    assert items == []
+    assert "本页商品列表为空" in captured.out
+
+
+def test_parse_search_results_reports_non_list_result_list(capsys):
+    items = asyncio.run(
+        _parse_search_results_json(
+            {"data": {"resultList": {"unexpected": "shape"}}},
+            source="search",
+        )
+    )
+
+    captured = capsys.readouterr()
+
+    assert items == []
+    assert "搜索响应类型异常" in captured.out
+    assert "dict" in captured.out
+
+
 def test_parse_user_head_and_items(load_json_fixture):
     head_json = load_json_fixture("user_head.json")
     items_json = load_json_fixture("user_items.json")

@@ -3,6 +3,7 @@ import asyncio
 
 from src.scraper import (
     ReusableSearchSession,
+    SearchRequestReplayInvalidError,
     SearchRequestTemplate,
     NEW_PUBLISH_POPUP_SELECTOR,
     NewPublishOptionNotFoundError,
@@ -10,6 +11,7 @@ from src.scraper import (
     LoginRequiredError,
     PlaywrightTimeoutError,
     _build_search_request_template_from_response,
+    _build_scrape_attempt_limit,
     _build_task_filter_signature,
     _can_replay_search_request,
     _can_reuse_search_session,
@@ -228,18 +230,26 @@ def test_search_request_template_rejects_missing_publish_sort():
 
 
 class _FakeApiResponse:
-    def __init__(self, ok=True, json_error=None, body=b"\xb5bad", headers=None):
+    def __init__(
+        self,
+        ok=True,
+        json_error=None,
+        body=b"\xb5bad",
+        headers=None,
+        json_data=None,
+    ):
         self.ok = ok
         self.status = 200 if ok else 500
         self.url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/"
         self._json_error = json_error
         self._body = body
         self.headers = headers or {}
+        self._json_data = json_data or {"data": {"resultList": []}}
 
     async def json(self):
         if self._json_error is not None:
             raise self._json_error
-        return {"data": {"resultList": []}}
+        return self._json_data
 
     async def body(self):
         return self._body
@@ -308,6 +318,80 @@ def test_replay_search_request_uses_saved_template_without_dom():
     ]
 
 
+def test_replay_search_request_accepts_empty_result_list():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    template = SearchRequestTemplate(
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option="最新",
+    )
+    session = ReusableSearchSession(
+        filter_signature=_build_task_filter_signature(task_config),
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        last_success_at=datetime(2026, 7, 22, 14, 57, 31),
+        search_request_template=template,
+    )
+    page = _FakeReplayPage(
+        api_response=_FakeApiResponse(json_data={"data": {"resultList": []}})
+    )
+
+    response = asyncio.run(
+        _replay_search_request_from_session(
+            page=page,
+            session=session,
+            task_config=task_config,
+            timeout_ms=20000,
+        )
+    )
+
+    assert response.ok is True
+    assert asyncio.run(response.json()) == {"data": {"resultList": []}}
+
+
+def test_replay_search_request_rejects_json_without_result_list():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    template = SearchRequestTemplate(
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option="最新",
+    )
+    session = ReusableSearchSession(
+        filter_signature=_build_task_filter_signature(task_config),
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        last_success_at=datetime(2026, 7, 22, 14, 57, 31),
+        search_request_template=template,
+    )
+    page = _FakeReplayPage(
+        api_response=_FakeApiResponse(
+            json_data={"ret": ["FAIL_SYS_TOKEN_EXOIRED::令牌过期"], "data": {}}
+        )
+    )
+
+    try:
+        asyncio.run(
+            _replay_search_request_from_session(
+                page=page,
+                session=session,
+                task_config=task_config,
+                timeout_ms=20000,
+            )
+        )
+    except SearchRequestReplayInvalidError as exc:
+        message = str(exc)
+        assert "resultList" in message
+        assert "FAIL_SYS_TOKEN_EXOIRED" in message
+        assert "top_keys" in message
+        assert "data_keys" in message
+    else:
+        raise AssertionError("expected replay payload validation failure")
+
+
 def test_replay_search_request_reports_non_json_response_details():
     task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
     template = SearchRequestTemplate(
@@ -347,6 +431,22 @@ def test_replay_search_request_reports_non_json_response_details():
         assert "body_hex=b5626164" in str(exc)
     else:
         raise AssertionError("expected replay failure with response diagnostics")
+
+
+def test_build_scrape_attempt_limit_adds_cold_fallback_for_replay():
+    rotation_settings = {
+        "account_retry_limit": 1,
+        "proxy_retry_limit": 1,
+    }
+
+    assert _build_scrape_attempt_limit(
+        rotation_settings,
+        starts_with_replay_template=True,
+    ) == 2
+    assert _build_scrape_attempt_limit(
+        rotation_settings,
+        starts_with_replay_template=False,
+    ) == 1
 
 
 def test_select_search_response_requires_filter_response_when_publish_filter_configured():

@@ -84,6 +84,10 @@ class SearchRequestReplayError(Exception):
     """复用筛选请求模板重新拉取商品时的可恢复异常。"""
 
 
+class SearchRequestReplayInvalidError(SearchRequestReplayError):
+    """复用接口返回非搜索列表结构，通常代表令牌、登录态或风控响应失效。"""
+
+
 @dataclass
 class SearchRequestTemplate:
     """保存一次已确认筛选搜索接口请求，复用轮用它直接重新拉取列表。"""
@@ -344,6 +348,39 @@ def _can_replay_search_request(
     )
 
 
+def _get_search_result_list(json_data: Any) -> Optional[list]:
+    """提取搜索结果列表；返回 None 表示响应不是可解析的搜索列表结构。"""
+    if not isinstance(json_data, dict):
+        return None
+    data = json_data.get("data")
+    if not isinstance(data, dict) or "resultList" not in data:
+        return None
+    result_list = data.get("resultList")
+    return result_list if isinstance(result_list, list) else None
+
+
+def _summarize_search_json_shape(json_data: Any) -> str:
+    """输出安全的响应结构摘要，用于定位令牌失效或风控响应，不暴露敏感头。"""
+    if not isinstance(json_data, dict):
+        return f"type={type(json_data).__name__}"
+    data = json_data.get("data")
+    top_keys = sorted(str(key) for key in json_data.keys())
+    data_keys = sorted(str(key) for key in data.keys()) if isinstance(data, dict) else []
+    ret_value = json_data.get("ret", "-")
+    return f"ret={ret_value}, top_keys={top_keys}, data_keys={data_keys}"
+
+
+def _validate_search_result_payload(json_data: Any, stage: str) -> None:
+    """校验搜索响应必须包含列表结构，避免把错误 JSON 当作 0 商品成功同步。"""
+    result_list = _get_search_result_list(json_data)
+    if result_list is not None:
+        return
+    raise SearchRequestReplayInvalidError(
+        f"复用筛选接口响应结构失效[{stage}]: 缺少可用的 data.resultList；"
+        f"{_summarize_search_json_shape(json_data)}"
+    )
+
+
 def _sanitize_search_request_headers(headers: Optional[dict]) -> dict:
     """保留 replay 所需白名单请求头，避免压缩/伪头导致 API 请求失败。"""
     if not isinstance(headers, dict):
@@ -479,12 +516,13 @@ async def _replay_search_request_from_session(
             f"复用筛选接口返回异常状态: {replay_response.status}"
         )
     try:
-        await replay_response.json()
+        replay_json = await replay_response.json()
     except Exception as exc:
         diagnostics = await replay_response.diagnostic_summary()
         raise SearchRequestReplayError(
             f"复用筛选接口返回非 JSON 数据: {exc}; {diagnostics}"
         ) from exc
+    _validate_search_result_payload(replay_json, "replay")
     return replay_response
 
 
@@ -996,6 +1034,22 @@ def _get_rotation_settings(task_config: dict) -> dict:
         "proxy_retry_limit": max(1, proxy_retry_limit),
         "proxy_blacklist_ttl": max(0, proxy_blacklist_ttl),
     }
+
+
+def _build_scrape_attempt_limit(
+    rotation_settings: dict,
+    *,
+    starts_with_replay_template: bool,
+) -> int:
+    """计算本轮最大尝试次数，给 replay 失效预留一次同账号冷启动补偿。"""
+    attempt_limit = max(
+        rotation_settings["account_retry_limit"],
+        rotation_settings["proxy_retry_limit"],
+        1,
+    )
+    if starts_with_replay_template:
+        return max(attempt_limit, 2)
+    return attempt_limit
 
 
 def _get_item_snapshot_keys(item: dict) -> set[str]:
@@ -1588,6 +1642,12 @@ async def scrape_xianyu(
                         "new_publish:replay",
                         new_publish_response,
                     )
+                except SearchRequestReplayInvalidError as e:
+                    close_session_reason = f"{e}，关闭复用会话"
+                    log_time(
+                        "replay 响应结构失效，关闭复用会话并本轮冷启动重试。"
+                    )
+                    raise
                 except SearchRequestReplayError as e:
                     close_session_reason = f"{e}，关闭复用会话"
                     log_time(f"{e}，本轮跳过并关闭复用会话，下轮从步骤 0 冷启动。")
@@ -2164,12 +2224,20 @@ async def scrape_xianyu(
         return processed_item_count
 
     processed_item_count = 0
-    attempt_limit = max(
-        rotation_settings["account_retry_limit"],
-        rotation_settings["proxy_retry_limit"],
-        1,
+    starts_with_replay_template = bool(
+        reusable_session is not None
+        and _has_live_page(reusable_session)
+        and _can_replay_search_request(
+            reusable_session,
+            task_config=task_config,
+        )
+    )
+    attempt_limit = _build_scrape_attempt_limit(
+        rotation_settings,
+        starts_with_replay_template=starts_with_replay_template,
     )
     last_error = ""
+    last_error_from_replay_invalid = False
     last_state_path: Optional[str] = None
 
     # If this task is already in a paused state, skip immediately.
@@ -2214,6 +2282,8 @@ async def scrape_xianyu(
         if attempt == 1:
             selected_account = _select_account()
             selected_proxy = _select_proxy()
+        elif last_error_from_replay_invalid:
+            last_error_from_replay_invalid = False
         else:
             if (
                 rotation_settings["account_enabled"]
@@ -2263,6 +2333,12 @@ async def scrape_xianyu(
             print(f"检测到风控或验证触发: {e}")
             # 风控验证通常不是简单轮换能解决的，避免无意义重试。
             break
+        except SearchRequestReplayInvalidError as e:
+            last_error = str(e)
+            last_error_from_replay_invalid = True
+            print(f"检测到复用筛选接口响应失效: {e}")
+            if attempt < attempt_limit:
+                print("将废弃复用会话，并在本轮重新从首页冷启动。")
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             print(f"本次尝试失败: {last_error}")

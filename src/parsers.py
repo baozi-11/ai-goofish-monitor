@@ -9,9 +9,29 @@ async def _parse_search_results_json(json_data: dict, source: str) -> list:
     """解析搜索API的JSON数据，返回基础商品信息列表。"""
     page_data = []
     try:
-        items = await safe_get(json_data, "data", "resultList", default=[])
+        data_node = json_data.get("data") if isinstance(json_data, dict) else None
+        if not isinstance(data_node, dict) or "resultList" not in data_node:
+            print(f"LOG: ({source}) 搜索响应结构异常，缺少 data.resultList。")
+            if AI_DEBUG_MODE:
+                print(f"--- [SEARCH DEBUG] RAW JSON RESPONSE from {source} ---")
+                print(json.dumps(json_data, ensure_ascii=False, indent=2))
+                print("----------------------------------------------------")
+            return []
+
+        items = data_node.get("resultList")
+        if not isinstance(items, list):
+            print(
+                f"LOG: ({source}) 搜索响应类型异常，data.resultList "
+                f"应为 list，实际为 {type(items).__name__}。"
+            )
+            if AI_DEBUG_MODE:
+                print(f"--- [SEARCH DEBUG] RAW JSON RESPONSE from {source} ---")
+                print(json.dumps(json_data, ensure_ascii=False, indent=2))
+                print("----------------------------------------------------")
+            return []
+
         if not items:
-            print(f"LOG: ({source}) API响应中未找到商品列表 (resultList)。")
+            print(f"LOG: ({source}) 本页商品列表为空。")
             if AI_DEBUG_MODE:
                 print(f"--- [SEARCH DEBUG] RAW JSON RESPONSE from {source} ---")
                 print(json.dumps(json_data, ensure_ascii=False, indent=2))
