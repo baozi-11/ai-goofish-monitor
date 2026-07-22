@@ -175,33 +175,49 @@ class _FakeLocator:
 
     def get_by_text(self, text: str, exact: bool = False):
         self.page.locator_text_calls.append((self.name, text, exact))
-        return self.page.option_locator
+        return self.page.option_locators.get(text, self.page.empty_locator)
 
 
 class _FakePage:
     def __init__(self):
         self.trigger_locator = _FakeLocator(self, "trigger")
         self.popup_locator = _FakeLocator(self, "popup")
-        self.option_locator = _FakeLocator(self, "option")
+        self.content_menu_locator = _FakeLocator(self, "content-menu")
+        self.empty_locator = _FakeLocator(self, "empty", count=0)
+        self.option_locators = {
+            "最新": _FakeLocator(self, "option:最新"),
+            "1天内": _FakeLocator(self, "option:1天内"),
+            "3天内": _FakeLocator(self, "option:3天内"),
+            "7天内": _FakeLocator(self, "option:7天内"),
+            "14天内": _FakeLocator(self, "option:14天内"),
+        }
         self.page_clicks = []
         self.text_calls = []
         self.locator_calls = []
         self.locator_text_calls = []
         self.filter_calls = []
         self.nth_calls = []
+        self.content_menu_info = None
 
     def get_by_text(self, text: str, exact: bool = False):
         self.text_calls.append((text, exact))
         if text == "新发布":
             return self.trigger_locator
-        return self.option_locator
+        return self.option_locators.get(text, self.empty_locator)
 
     def locator(self, selector: str):
         self.locator_calls.append(selector)
+        if "data-goofish-new-publish-menu" in selector:
+            return self.content_menu_locator
         return self.popup_locator
 
     async def click(self, selector: str):
         self.page_clicks.append(selector)
+
+    async def evaluate(self, script, arg=None):
+        self.evaluate_calls = getattr(self, "evaluate_calls", [])
+        self.evaluate_calls.append((script, arg))
+        return self.content_menu_info
 
 
 def test_click_new_publish_option_uses_scoped_popup_locator():
@@ -213,14 +229,38 @@ def test_click_new_publish_option_uses_scoped_popup_locator():
     assert page.trigger_locator.clicks == 1
     assert page.locator_calls == [NEW_PUBLISH_POPUP_SELECTOR]
     assert page.locator_text_calls == [("popup", "最新", True)]
-    assert page.option_locator.clicks == 1
+    assert page.option_locators["最新"].clicks == 1
     assert page.page_clicks == []
+
+
+def test_click_new_publish_option_uses_task_configured_option():
+    page = _FakePage()
+
+    asyncio.run(_open_new_publish_filter(page))
+    asyncio.run(_click_new_publish_option_in_open_filter(page, "1天内"))
+
+    assert page.option_locators["1天内"].clicks == 1
+    assert page.option_locators["最新"].clicks == 0
+
+
+def test_find_new_publish_option_recognizes_content_menu_without_fixed_popup():
+    page = _FakePage()
+    page.popup_locator._count = 0
+    page.content_menu_info = {
+        "matched_options": ["最新", "1天内", "3天内"],
+        "text": "最新 1天内 3天内 7天内 14天内",
+    }
+
+    option = asyncio.run(_find_new_publish_option_in_open_filter(page, "3天内"))
+
+    assert option is page.option_locators["3天内"]
+    assert any("data-goofish-new-publish-menu" in s for s in page.locator_calls)
 
 
 def test_find_new_publish_option_reports_missing_popup_before_response_wait():
     page = _FakePage()
     page.popup_locator._count = 0
-    page.option_locator._count = 1
+    page.option_locators["最新"]._count = 1
 
     try:
         asyncio.run(_find_new_publish_option_in_open_filter(page, "最新"))
@@ -234,7 +274,7 @@ def test_find_new_publish_option_reports_missing_popup_before_response_wait():
 
 def test_find_new_publish_option_reports_missing_option_before_response_wait():
     page = _FakePage()
-    page.option_locator._count = 0
+    page.option_locators["最新"]._count = 0
 
     try:
         asyncio.run(_find_new_publish_option_in_open_filter(page, "最新"))

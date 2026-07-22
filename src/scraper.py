@@ -124,6 +124,8 @@ INITIAL_SEARCH_RESPONSE_TIMEOUT_MS = 30_000
 INITIAL_SEARCH_RESPONSE_RETRY_COUNT = 2
 INITIAL_SEARCH_RESPONSE_RETRY_DELAY_SECONDS = 5
 QUICK_NOTIFY_REASON = "搜索列表发现新商品"
+NEW_PUBLISH_OPTIONS = ("最新", "1天内", "3天内", "7天内", "14天内")
+NEW_PUBLISH_MENU_MARKER = "data-goofish-new-publish-menu"
 NEW_PUBLISH_POPUP_SELECTOR = (
     "div.ant-popover, div.ant-select-dropdown, div.ant-dropdown, "
     "div[role='tooltip'], div[role='menu'], "
@@ -298,29 +300,128 @@ async def _first_visible_locator(locator: Any, max_candidates: int = 20) -> Opti
     return None
 
 
+async def _mark_new_publish_menu_by_content(
+    page: Any,
+    required_option: str,
+    logger: Any = log_time,
+) -> Optional[dict]:
+    """按发布时间选项组识别菜单容器，避免依赖闲鱼频繁变化的弹层类名。"""
+    marker = NEW_PUBLISH_MENU_MARKER
+    options = list(NEW_PUBLISH_OPTIONS)
+    menu_info = await page.evaluate(
+        """
+        ({ marker, options, requiredOption }) => {
+            const normalize = (value) => String(value || '').replace(/\\s+/g, '');
+            const isVisible = (element) => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && style.opacity !== '0'
+                    && rect.width > 0
+                    && rect.height > 0;
+            };
+
+            document.querySelectorAll(`[${marker}]`).forEach((element) => {
+                element.removeAttribute(marker);
+            });
+
+            const candidates = Array.from(document.querySelectorAll('body *'))
+                .filter(isVisible)
+                .map((element) => {
+                    const text = normalize(element.innerText || element.textContent || '');
+                    const matchedOptions = options.filter((option) => text.includes(option));
+                    const rect = element.getBoundingClientRect();
+                    return {
+                        element,
+                        text,
+                        matchedOptions,
+                        area: rect.width * rect.height,
+                    };
+                })
+                .filter((candidate) => {
+                    return candidate.matchedOptions.length >= 2
+                        && candidate.matchedOptions.includes(requiredOption);
+                });
+
+            if (!candidates.length) {
+                return null;
+            }
+
+            candidates.sort((left, right) => {
+                if (left.text.length !== right.text.length) {
+                    return left.text.length - right.text.length;
+                }
+                if (left.area !== right.area) {
+                    return left.area - right.area;
+                }
+                return right.matchedOptions.length - left.matchedOptions.length;
+            });
+
+            const selected = candidates[0];
+            selected.element.setAttribute(marker, '1');
+            return {
+                matched_options: selected.matchedOptions,
+                text: selected.text.slice(0, 120),
+            };
+        }
+        """,
+        {
+            "marker": marker,
+            "options": options,
+            "requiredOption": required_option,
+        },
+    )
+    if menu_info:
+        logger(
+            "新发布筛选菜单识别: "
+            f"options={menu_info.get('matched_options')}, "
+            f"text={menu_info.get('text')}"
+        )
+    return menu_info
+
+
+async def _find_new_publish_menu_container(
+    page: Any,
+    required_option: str,
+) -> Optional[Any]:
+    """查找包含发布时间选项组的菜单容器，先用固定弹层，再用内容识别兜底。"""
+    fixed_popup = page.locator(NEW_PUBLISH_POPUP_SELECTOR).filter(
+        has=page.get_by_text(required_option, exact=True)
+    ).last
+    if await fixed_popup.count():
+        try:
+            await fixed_popup.wait_for(state="visible", timeout=5000)
+            return fixed_popup
+        except PlaywrightTimeoutError:
+            pass
+
+    menu_info = await _mark_new_publish_menu_by_content(page, required_option)
+    if not menu_info:
+        return None
+
+    content_menu = page.locator(f"[{NEW_PUBLISH_MENU_MARKER}='1']").first
+    if await content_menu.count():
+        return content_menu
+    return None
+
+
 async def _find_new_publish_option_in_open_filter(
     page: Any,
     new_publish_option: str,
 ) -> Any:
     """定位新发布筛选选项，区分弹层缺失和选项缺失两类页面状态。"""
     option_text = str(new_publish_option).strip()
-    popup = page.locator(NEW_PUBLISH_POPUP_SELECTOR).filter(
-        has=page.get_by_text(option_text, exact=True)
-    ).last
+    if option_text not in NEW_PUBLISH_OPTIONS:
+        raise NewPublishOptionNotFoundError(f"新发布选项 '{option_text}' 未找到")
 
-    popup_exists = bool(await popup.count())
-    if popup_exists:
-        try:
-            await popup.wait_for(state="visible", timeout=5000)
-        except PlaywrightTimeoutError as e:
-            raise NewPublishPopupNotFoundError("新发布筛选弹层未出现") from e
-        option = popup.get_by_text(option_text, exact=True)
-        visible_option = await _first_visible_locator(option)
-        if visible_option is not None:
-            return visible_option
-
-    if not popup_exists:
+    menu_container = await _find_new_publish_menu_container(page, option_text)
+    if menu_container is None:
         raise NewPublishPopupNotFoundError("新发布筛选弹层未出现")
+    option = menu_container.get_by_text(option_text, exact=True)
+    visible_option = await _first_visible_locator(option)
+    if visible_option is not None:
+        return visible_option
     raise NewPublishOptionNotFoundError(f"新发布选项 '{option_text}' 未找到")
 
 
