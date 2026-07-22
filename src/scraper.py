@@ -181,13 +181,72 @@ def _select_search_response_for_processing(
     *,
     initial_response: Optional[Any],
     final_response: Optional[Any],
+    publish_response: Optional[Any],
     requires_filter_response: bool,
 ) -> Optional[Any]:
+    if requires_filter_response and not (
+        publish_response and getattr(publish_response, "ok", False)
+    ):
+        return None
     if final_response and final_response.ok:
         return final_response
-    if requires_filter_response:
-        return None
+    if publish_response and getattr(publish_response, "ok", False):
+        return publish_response
     return initial_response
+
+
+def _search_response_stage_for_log(
+    *,
+    selected_response: Optional[Any],
+    initial_response: Optional[Any],
+    publish_response: Optional[Any],
+    final_response: Optional[Any],
+) -> str:
+    if selected_response is None:
+        return "none"
+    if selected_response is publish_response:
+        return "new_publish"
+    if selected_response is final_response:
+        return "final"
+    if selected_response is initial_response:
+        return "initial"
+    return "unknown"
+
+
+def _summarize_response_post_data(response: Optional[Any], max_length: int = 500) -> str:
+    if response is None:
+        return "-"
+    request = getattr(response, "request", None)
+    post_data = getattr(request, "post_data", "") if request is not None else ""
+    if callable(post_data):
+        try:
+            post_data = post_data()
+        except Exception:
+            post_data = ""
+    if isinstance(post_data, bytes):
+        post_data = post_data.decode("utf-8", errors="replace")
+    post_data = " ".join(str(post_data or "").split())
+    if len(post_data) > max_length:
+        return post_data[:max_length] + "...(truncated)"
+    return post_data or "-"
+
+
+def _log_search_response_trace(
+    stage: str,
+    response: Optional[Any],
+    logger: Any = log_time,
+) -> None:
+    """记录搜索接口响应的阶段化诊断信息，方便确认最终解析来源。"""
+    if response is None:
+        logger(f"搜索响应诊断[{stage}]: 无响应")
+        return
+    response_url = getattr(response, "url", "")
+    response_ok = getattr(response, "ok", None)
+    post_summary = _summarize_response_post_data(response)
+    logger(
+        f"搜索响应诊断[{stage}]: ok={response_ok}, "
+        f"url={response_url}, post={post_summary}"
+    )
 
 
 def _select_latest_ok_search_response(
@@ -259,12 +318,6 @@ async def _find_new_publish_option_in_open_filter(
         visible_option = await _first_visible_locator(option)
         if visible_option is not None:
             return visible_option
-
-    # 闲鱼前端偶尔会更换弹层容器类名；兜底只选可见的精确文本候选。
-    fallback_option = page.get_by_text(option_text, exact=True)
-    visible_fallback = await _first_visible_locator(fallback_option)
-    if visible_fallback is not None:
-        return visible_fallback
 
     if not popup_exists:
         raise NewPublishPopupNotFoundError("新发布筛选弹层未出现")
@@ -1107,6 +1160,7 @@ async def scrape_xianyu(
 
                     # 捕获初始搜索的API数据
                     initial_response = await initial_response_info.value
+                    _log_search_response_trace("initial", initial_response)
                     break
                 except PlaywrightTimeoutError:
                     if _is_login_url(page.url):
@@ -1221,6 +1275,7 @@ async def scrape_xianyu(
                 print("LOG: 未检测到广告弹窗。")
 
             final_response = None
+            new_publish_response = None
             log_time("步骤 2 - 应用筛选条件...")
             if new_publish_option:
                 try:
@@ -1237,12 +1292,17 @@ async def scrape_xianyu(
                     async def _click_new_publish_option() -> None:
                         await new_publish_option_locator.click()
 
-                    final_response = await _capture_search_response_after_action(
+                    new_publish_response = await _capture_search_response_after_action(
                         page=page,
                         action=_click_new_publish_option,
                         timeout_ms=20000,
                         settle_min_seconds=2,
                         settle_max_seconds=4,
+                    )
+                    final_response = new_publish_response
+                    _log_search_response_trace(
+                        "new_publish",
+                        new_publish_response,
                     )
                 except NewPublishPopupNotFoundError as e:
                     log_time(
@@ -1272,6 +1332,7 @@ async def scrape_xianyu(
                         # --- 修改: 将固定等待改为随机等待，并加长 ---
                         await random_sleep(2, 4)  # 原来是 asyncio.sleep(5)
                     final_response = await response_info.value
+                    _log_search_response_trace("final:personal_only", final_response)
                 except PlaywrightTimeoutError:
                     log_time("个人闲置筛选请求超时，继续执行。")
                 except Exception as e:
@@ -1285,6 +1346,7 @@ async def scrape_xianyu(
                         await page.click("text=包邮")
                         await random_sleep(2, 4)
                     final_response = await response_info.value
+                    _log_search_response_trace("final:free_shipping", final_response)
                 except PlaywrightTimeoutError:
                     log_time("包邮筛选请求超时，继续执行。")
                 except Exception as e:
@@ -1378,6 +1440,10 @@ async def scrape_xianyu(
                                     await search_btn.click()
                                     await random_sleep(2, 3)
                                 final_response = await response_info.value
+                                _log_search_response_trace(
+                                    "final:region",
+                                    final_response,
+                                )
                             except PlaywrightTimeoutError:
                                 log_time("区域筛选提交超时，继续执行。")
                         else:
@@ -1419,6 +1485,7 @@ async def scrape_xianyu(
                             # --- 修改: 增加确认价格后的等待时间 ---
                             await random_sleep(2, 4)  # 原来是 asyncio.sleep(5)
                         final_response = await response_info.value
+                        _log_search_response_trace("final:price", final_response)
                     else:
                         print("LOG: 警告 - 未找到价格输入容器。")
                 except PlaywrightTimeoutError:
@@ -1434,8 +1501,17 @@ async def scrape_xianyu(
             current_response = _select_search_response_for_processing(
                 initial_response=initial_response,
                 final_response=final_response,
+                publish_response=new_publish_response,
                 requires_filter_response=requires_filter_response,
             )
+            _log_search_response_trace("final", final_response)
+            selected_response_stage = _search_response_stage_for_log(
+                selected_response=current_response,
+                initial_response=initial_response,
+                publish_response=new_publish_response,
+                final_response=final_response,
+            )
+            log_time(f"搜索响应诊断[selected]: stage={selected_response_stage}")
             if current_response is None:
                 log_time(
                     "已配置新发布筛选，但未获得筛选后的搜索响应，"

@@ -14,6 +14,7 @@ from src.scraper import (
     _find_new_publish_option_in_open_filter,
     _open_new_publish_filter,
     _requires_confirmed_filter_response,
+    _search_response_stage_for_log,
     _select_latest_ok_search_response,
     _select_search_response_for_processing,
 )
@@ -70,11 +71,13 @@ class _FakeResponse:
 
 def test_select_search_response_requires_filter_response_when_publish_filter_configured():
     initial_response = _FakeResponse(ok=True)
+    other_filter_response = _FakeResponse(ok=True)
 
     assert _requires_confirmed_filter_response({"new_publish_option": "最新"}) is True
     assert _select_search_response_for_processing(
         initial_response=initial_response,
-        final_response=None,
+        final_response=other_filter_response,
+        publish_response=None,
         requires_filter_response=True,
     ) is None
 
@@ -86,8 +89,46 @@ def test_select_search_response_allows_initial_response_without_publish_filter()
     assert _select_search_response_for_processing(
         initial_response=initial_response,
         final_response=None,
+        publish_response=None,
         requires_filter_response=False,
     ) is initial_response
+
+
+def test_select_search_response_keeps_publish_confirmation_after_later_filter():
+    initial_response = _FakeResponse(ok=True)
+    publish_response = _FakeResponse(ok=True)
+    later_filter_response = _FakeResponse(ok=True)
+
+    assert _select_search_response_for_processing(
+        initial_response=initial_response,
+        final_response=later_filter_response,
+        publish_response=publish_response,
+        requires_filter_response=True,
+    ) is later_filter_response
+
+
+def test_select_search_response_uses_publish_response_when_no_later_filter():
+    initial_response = _FakeResponse(ok=True)
+    publish_response = _FakeResponse(ok=True)
+
+    assert _select_search_response_for_processing(
+        initial_response=initial_response,
+        final_response=None,
+        publish_response=publish_response,
+        requires_filter_response=True,
+    ) is publish_response
+
+
+def test_search_response_stage_prefers_new_publish_when_response_is_shared():
+    initial_response = _FakeResponse(ok=True)
+    publish_response = _FakeResponse(ok=True)
+
+    assert _search_response_stage_for_log(
+        selected_response=publish_response,
+        initial_response=initial_response,
+        publish_response=publish_response,
+        final_response=publish_response,
+    ) == "new_publish"
 
 
 def test_select_latest_ok_search_response_uses_last_successful_response():
@@ -179,12 +220,14 @@ def test_click_new_publish_option_uses_scoped_popup_locator():
 def test_find_new_publish_option_reports_missing_popup_before_response_wait():
     page = _FakePage()
     page.popup_locator._count = 0
-    page.option_locator._count = 0
+    page.option_locator._count = 1
 
     try:
         asyncio.run(_find_new_publish_option_in_open_filter(page, "最新"))
     except NewPublishPopupNotFoundError as exc:
         assert str(exc) == "新发布筛选弹层未出现"
+        assert page.option_locator.clicks == 0
+        assert page.nth_calls == []
     else:
         raise AssertionError("expected NewPublishPopupNotFoundError")
 
