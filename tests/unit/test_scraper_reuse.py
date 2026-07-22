@@ -3,12 +3,15 @@ import asyncio
 
 from src.scraper import (
     ReusableSearchSession,
+    SearchRequestTemplate,
     NEW_PUBLISH_POPUP_SELECTOR,
     NewPublishOptionNotFoundError,
     NewPublishPopupNotFoundError,
     LoginRequiredError,
     PlaywrightTimeoutError,
+    _build_search_request_template_from_response,
     _build_task_filter_signature,
+    _can_replay_search_request,
     _can_reuse_search_session,
     _click_new_publish_option_in_open_filter,
     _capture_search_response_after_action,
@@ -16,9 +19,10 @@ from src.scraper import (
     _is_login_modal_visible,
     _open_new_publish_filter,
     _retain_successful_search_session,
+    _replay_search_request_from_session,
     _requires_confirmed_filter_response,
     _search_response_stage_for_log,
-    _should_reuse_current_search_page,
+    _search_request_template_is_trusted,
     _select_latest_ok_search_response,
     _select_search_response_for_processing,
 )
@@ -75,6 +79,13 @@ def test_retain_successful_search_session_marks_zero_new_item_sync_success():
     context = object()
     browser = object()
     playwright = object()
+    template = SearchRequestTemplate(
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+        headers={},
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option="最新",
+    )
 
     _retain_successful_search_session(
         session=session,
@@ -85,6 +96,7 @@ def test_retain_successful_search_session_marks_zero_new_item_sync_success():
         browser=browser,
         context=context,
         page=page,
+        search_request_template=template,
     )
 
     assert session.filter_signature == _build_task_filter_signature(task_config)
@@ -95,35 +107,179 @@ def test_retain_successful_search_session_marks_zero_new_item_sync_success():
     assert session.browser is browser
     assert session.context is context
     assert session.page is page
+    assert session.search_request_template is template
 
 
-def test_should_reuse_current_search_page_when_publish_filter_exists():
+def test_can_replay_search_request_with_matching_confirmed_template():
     task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    session = ReusableSearchSession(
+        filter_signature=_build_task_filter_signature(task_config),
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        last_success_at=datetime(2026, 7, 22, 14, 57, 31),
+        search_request_template=SearchRequestTemplate(
+            url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+            post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            filter_signature=_build_task_filter_signature(task_config),
+            new_publish_option="最新",
+        ),
+    )
 
-    assert _should_reuse_current_search_page(
-        session_can_keep_browser=True,
+    assert _can_replay_search_request(
+        session,
         task_config=task_config,
     ) is True
 
 
-def test_should_not_reuse_current_search_page_without_publish_filter():
-    task_config = {"keyword": "dim十字绣", "new_publish_option": ""}
+def test_can_replay_search_request_rejects_filter_signature_change():
+    original_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    session = ReusableSearchSession(
+        filter_signature=_build_task_filter_signature(original_config),
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        last_success_at=datetime(2026, 7, 22, 14, 57, 31),
+        search_request_template=SearchRequestTemplate(
+            url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+            post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+            headers={},
+            filter_signature=_build_task_filter_signature(original_config),
+            new_publish_option="最新",
+        ),
+    )
 
-    assert _should_reuse_current_search_page(
-        session_can_keep_browser=True,
-        task_config=task_config,
+    assert _can_replay_search_request(
+        session,
+        task_config={"keyword": "dim十字绣", "new_publish_option": "1天内"},
     ) is False
 
 
 class _FakeRequest:
-    def __init__(self, post_data: str = ""):
+    def __init__(self, post_data: str = "", headers=None):
         self.post_data = post_data
+        self.headers = headers or {}
+
+    async def all_headers(self):
+        return self.headers
 
 
 class _FakeResponse:
-    def __init__(self, ok: bool, post_data: str = ""):
+    def __init__(self, ok: bool, post_data: str = "", headers=None):
         self.ok = ok
-        self.request = _FakeRequest(post_data)
+        self.url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/"
+        self.request = _FakeRequest(post_data, headers=headers)
+
+    async def json(self):
+        return {"data": {"resultList": []}}
+
+
+def test_build_search_request_template_from_response_keeps_confirmed_request():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    response = _FakeResponse(
+        ok=True,
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+        headers={
+            "content-type": "application/x-www-form-urlencoded",
+            "cookie": "redacted",
+            "content-length": "123",
+        },
+    )
+
+    template = asyncio.run(
+        _build_search_request_template_from_response(
+            response=response,
+            task_config=task_config,
+            new_publish_option="最新",
+        )
+    )
+
+    assert template.url == response.url
+    assert template.post_data == response.request.post_data
+    assert template.filter_signature == _build_task_filter_signature(task_config)
+    assert template.new_publish_option == "最新"
+    assert template.headers == {"content-type": "application/x-www-form-urlencoded"}
+
+
+def test_search_request_template_rejects_missing_publish_sort():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    template = SearchRequestTemplate(
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true}',
+        headers={},
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option="最新",
+    )
+
+    assert _search_request_template_is_trusted(template, task_config) is False
+
+
+class _FakeApiResponse:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.status = 200 if ok else 500
+        self.url = "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/"
+
+    async def json(self):
+        return {"data": {"resultList": []}}
+
+
+class _FakeRequestContext:
+    def __init__(self):
+        self.post_calls = []
+
+    async def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        return _FakeApiResponse(ok=True)
+
+
+class _FakeBrowserContext:
+    def __init__(self):
+        self.request = _FakeRequestContext()
+
+
+class _FakeReplayPage:
+    def __init__(self):
+        self.context = _FakeBrowserContext()
+
+
+def test_replay_search_request_uses_saved_template_without_dom():
+    task_config = {"keyword": "dim十字绣", "new_publish_option": "最新"}
+    template = SearchRequestTemplate(
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/",
+        post_data='data={"pageNumber":1,"keyword":"dim十字绣","fromFilter":true,"sortField":"create","sortValue":"desc"}',
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option="最新",
+    )
+    session = ReusableSearchSession(
+        filter_signature=_build_task_filter_signature(task_config),
+        state_file="state/baozi-166.json",
+        proxy_server=None,
+        last_success_at=datetime(2026, 7, 22, 14, 57, 31),
+        search_request_template=template,
+    )
+    page = _FakeReplayPage()
+
+    response = asyncio.run(
+        _replay_search_request_from_session(
+            page=page,
+            session=session,
+            task_config=task_config,
+            timeout_ms=20000,
+        )
+    )
+
+    assert response.ok is True
+    assert page.context.request.post_calls == [
+        (
+            template.url,
+            {
+                "data": template.post_data,
+                "headers": template.headers,
+                "timeout": 20000,
+            },
+        )
+    ]
 
 
 def test_select_search_response_requires_filter_response_when_publish_filter_configured():
@@ -382,7 +538,7 @@ def test_find_new_publish_option_reports_missing_popup_before_response_wait():
         asyncio.run(_find_new_publish_option_in_open_filter(page, "最新"))
     except NewPublishPopupNotFoundError as exc:
         assert str(exc) == "新发布筛选弹层未出现"
-        assert page.option_locator.clicks == 0
+        assert page.option_locators["最新"].clicks == 0
         assert page.nth_calls == []
     else:
         raise AssertionError("expected NewPublishPopupNotFoundError")

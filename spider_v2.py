@@ -170,7 +170,10 @@ async def load_tasks_config(config_path: str | None = None) -> list:
     else:
         repository = SqliteTaskRepository()
         tasks = await repository.find_all()
-        tasks_config = [task.dict() for task in tasks]
+        tasks_config = [
+            task.model_dump() if hasattr(task, "model_dump") else task.dict()
+            for task in tasks
+        ]
 
     if not os.path.exists(STATE_FILE) and not has_bound_account(tasks_config) and not has_any_state_file():
         sys.exit(

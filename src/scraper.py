@@ -79,6 +79,21 @@ class NewPublishOptionNotFoundError(NewPublishFilterError):
     """筛选弹层已出现，但没有找到任务配置对应的发布时间选项。"""
 
 
+class SearchRequestReplayError(Exception):
+    """复用筛选请求模板重新拉取商品时的可恢复异常。"""
+
+
+@dataclass
+class SearchRequestTemplate:
+    """保存一次已确认筛选搜索接口请求，复用轮用它直接重新拉取列表。"""
+
+    url: str
+    post_data: str
+    headers: dict
+    filter_signature: tuple
+    new_publish_option: str
+
+
 @dataclass
 class ReusableSearchSession:
     """保存定时监控可复用的浏览器页面和筛选状态。"""
@@ -92,6 +107,7 @@ class ReusableSearchSession:
     context: Optional[Any] = None
     page: Optional[Any] = None
     search_url: Optional[str] = None
+    search_request_template: Optional[SearchRequestTemplate] = None
 
     async def close(self) -> None:
         """关闭浏览器资源，并清空会话状态，保证下轮从首页冷启动。"""
@@ -116,6 +132,7 @@ class ReusableSearchSession:
         self.context = None
         self.page = None
         self.search_url = None
+        self.search_request_template = None
 
 
 FAILURE_GUARD = FailureGuard()
@@ -185,6 +202,7 @@ def _retain_successful_search_session(
     browser: Optional[Any],
     context: Optional[Any],
     page: Optional[Any],
+    search_request_template: Optional[SearchRequestTemplate] = None,
 ) -> None:
     """记录一次完整筛选同步成功后的浏览器会话，供下一轮定时任务复用。"""
     session.filter_signature = _build_task_filter_signature(task_config)
@@ -196,19 +214,11 @@ def _retain_successful_search_session(
     session.context = context
     session.page = page
     session.search_url = None
+    session.search_request_template = search_request_template
 
 
 def _requires_confirmed_filter_response(task_config: dict) -> bool:
     return bool(_normalize_new_publish_option(task_config))
-
-
-def _should_reuse_current_search_page(
-    *,
-    session_can_keep_browser: bool,
-    task_config: dict,
-) -> bool:
-    """判断本轮是否直接复用当前搜索页，避免重复导航触发初始接口超时。"""
-    return bool(session_can_keep_browser and _normalize_new_publish_option(task_config))
 
 
 def _select_search_response_for_processing(
@@ -249,8 +259,8 @@ def _get_response_post_data(response: Optional[Any]) -> str:
     return str(post_data or "")
 
 
-def _decode_search_post_payload(response: Optional[Any]) -> dict:
-    post_data = _get_response_post_data(response).strip()
+def _decode_search_post_data(post_data: str) -> dict:
+    post_data = str(post_data or "").strip()
     if not post_data:
         return {}
     try:
@@ -268,6 +278,10 @@ def _decode_search_post_payload(response: Optional[Any]) -> dict:
     return {}
 
 
+def _decode_search_post_payload(response: Optional[Any]) -> dict:
+    return _decode_search_post_data(_get_response_post_data(response))
+
+
 def _response_preserves_publish_sort(
     final_response: Optional[Any],
     publish_response: Optional[Any],
@@ -282,6 +296,148 @@ def _response_preserves_publish_sort(
         str(final_payload.get("sortField") or "").strip() == publish_sort_field
         and str(final_payload.get("sortValue") or "").strip() == publish_sort_value
     )
+
+
+def _search_request_template_is_trusted(
+    template: Optional[SearchRequestTemplate],
+    task_config: dict,
+) -> bool:
+    """校验复用模板仍对应当前任务，且保留“新发布=最新”的排序参数。"""
+    if template is None:
+        return False
+    if template.filter_signature != _build_task_filter_signature(task_config):
+        return False
+    if template.new_publish_option != _normalize_new_publish_option(task_config):
+        return False
+    payload = _decode_search_post_data(template.post_data)
+    if template.new_publish_option == "最新":
+        return (
+            str(payload.get("sortField") or "").strip() == "create"
+            and str(payload.get("sortValue") or "").strip() == "desc"
+        )
+    return bool(payload.get("fromFilter"))
+
+
+def _can_replay_search_request(
+    session: Optional[ReusableSearchSession],
+    *,
+    task_config: dict,
+) -> bool:
+    """判断复用轮是否可以跳过 DOM，直接重放上轮已确认筛选接口请求。"""
+    if session is None or session.last_success_at is None:
+        return False
+    return _search_request_template_is_trusted(
+        session.search_request_template,
+        task_config,
+    )
+
+
+def _sanitize_search_request_headers(headers: Optional[dict]) -> dict:
+    """保留 replay 所需的普通请求头，去掉容易过期或由浏览器上下文托管的头。"""
+    if not isinstance(headers, dict):
+        return {}
+    excluded = {
+        "cookie",
+        "content-length",
+        "host",
+        "origin",
+        "referer",
+        "connection",
+    }
+    return {
+        str(key): str(value)
+        for key, value in headers.items()
+        if str(key).lower() not in excluded and value is not None
+    }
+
+
+async def _build_search_request_template_from_response(
+    *,
+    response: Any,
+    task_config: dict,
+    new_publish_option: str,
+) -> SearchRequestTemplate:
+    """从已确认用于解析的搜索响应中提取可复用的接口请求模板。"""
+    request = getattr(response, "request", None)
+    headers = {}
+    if request is not None:
+        all_headers = getattr(request, "all_headers", None)
+        if callable(all_headers):
+            try:
+                headers = await all_headers()
+            except Exception:
+                headers = getattr(request, "headers", {}) or {}
+        else:
+            headers = getattr(request, "headers", {}) or {}
+    return SearchRequestTemplate(
+        url=str(getattr(response, "url", "") or ""),
+        post_data=_get_response_post_data(response),
+        headers=_sanitize_search_request_headers(headers),
+        filter_signature=_build_task_filter_signature(task_config),
+        new_publish_option=new_publish_option,
+    )
+
+
+class _ReplaySearchRequest:
+    """让 API replay 响应保留 request.post_data，供诊断和筛选校验复用。"""
+
+    def __init__(self, post_data: str, headers: dict):
+        self.post_data = post_data
+        self.headers = headers
+
+
+class _ReplaySearchResponse:
+    """包装 Playwright APIResponse，使其兼容现有搜索结果解析流程。"""
+
+    def __init__(self, api_response: Any, template: SearchRequestTemplate):
+        self._api_response = api_response
+        self._json_cache = None
+        self.ok = bool(getattr(api_response, "ok", False))
+        self.status = getattr(api_response, "status", None)
+        self.url = str(getattr(api_response, "url", "") or template.url)
+        self.request = _ReplaySearchRequest(template.post_data, template.headers)
+
+    async def json(self) -> Any:
+        if self._json_cache is None:
+            self._json_cache = await self._api_response.json()
+        return self._json_cache
+
+
+async def _replay_search_request_from_session(
+    *,
+    page: Any,
+    session: ReusableSearchSession,
+    task_config: dict,
+    timeout_ms: int = 20000,
+) -> _ReplaySearchResponse:
+    """使用当前浏览器上下文重放已确认筛选请求，避免复用轮再依赖页面 DOM。"""
+    template = session.search_request_template
+    if not _search_request_template_is_trusted(template, task_config):
+        raise SearchRequestReplayError("筛选请求模板不存在或与当前任务配置不匹配")
+    request_context = getattr(getattr(page, "context", None), "request", None)
+    if request_context is None:
+        raise SearchRequestReplayError("当前页面缺少可用的 API 请求上下文")
+    try:
+        api_response = await request_context.post(
+            template.url,
+            data=template.post_data,
+            headers=template.headers,
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise SearchRequestReplayError("复用筛选接口请求超时") from exc
+    except Exception as exc:
+        raise SearchRequestReplayError(f"复用筛选接口请求失败: {exc}") from exc
+    replay_response = _ReplaySearchResponse(api_response, template)
+    if not replay_response.ok:
+        raise SearchRequestReplayError(
+            f"复用筛选接口返回异常状态: {replay_response.status}"
+        )
+    try:
+        await replay_response.json()
+    except Exception as exc:
+        raise SearchRequestReplayError(f"复用筛选接口返回非 JSON 数据: {exc}") from exc
+    return replay_response
 
 
 def _search_response_stage_for_log(
@@ -1319,12 +1475,27 @@ async def scrape_xianyu(
             reusable_session.context = context
             reusable_session.page = page
 
-        reuse_current_search_page = _should_reuse_current_search_page(
-            session_can_keep_browser=session_can_keep_browser,
-            task_config=task_config,
+        replay_confirmed_search_request = (
+            session_can_keep_browser
+            and _can_replay_search_request(
+                reusable_session,
+                task_config=task_config,
+            )
         )
 
         try:
+            if (
+                session_can_keep_browser
+                and new_publish_option
+                and not replay_confirmed_search_request
+            ):
+                close_session_reason = "复用筛选请求模板不存在或与当前配置不匹配，关闭复用会话"
+                log_time(
+                    "复用筛选请求模板不存在或与当前任务配置不匹配，"
+                    "本轮跳过并关闭复用会话，下轮从步骤 0 冷启动。"
+                )
+                return 0
+
             if not session_can_keep_browser:
                 # 步骤 0 - 模拟真实用户：先访问首页（重要的反检测措施）
                 log_time("步骤 0 - 模拟真实用户访问首页...")
@@ -1342,8 +1513,8 @@ async def scrape_xianyu(
                 )
                 await random_sleep(1, 2)
             else:
-                if reuse_current_search_page:
-                    log_time("复用浏览器跳过首页，直接在当前搜索页重新应用筛选...")
+                if replay_confirmed_search_request:
+                    log_time("复用浏览器跳过首页，直接使用上轮筛选接口模板查询...")
                 else:
                     log_time("复用浏览器跳过首页，重新查询并应用筛选...")
 
@@ -1352,9 +1523,27 @@ async def scrape_xianyu(
             search_url = f"https://www.goofish.com/search?{urlencode(params)}"
 
             initial_response = None
-            if reuse_current_search_page:
-                log_time("步骤 1 - 复用当前搜索页，跳过搜索页导航。")
+            final_response = None
+            new_publish_response = None
+            if replay_confirmed_search_request:
+                log_time("步骤 1 - 复用筛选接口模板，跳过搜索页导航和 DOM 筛选。")
                 log_time(f"当前页面URL: {page.url}")
+                try:
+                    new_publish_response = await _replay_search_request_from_session(
+                        page=page,
+                        session=reusable_session,
+                        task_config=task_config,
+                        timeout_ms=20000,
+                    )
+                    final_response = new_publish_response
+                    _log_search_response_trace(
+                        "new_publish:replay",
+                        new_publish_response,
+                    )
+                except SearchRequestReplayError as e:
+                    close_session_reason = f"{e}，关闭复用会话"
+                    log_time(f"{e}，本轮跳过并关闭复用会话，下轮从步骤 0 冷启动。")
+                    return 0
             else:
                 log_time("步骤 1 - 导航到搜索结果页...")
                 log_time(f"目标URL: {search_url}")
@@ -1423,79 +1612,84 @@ async def scrape_xianyu(
                             continue
                         raise
 
-            # 等待页面加载出关键筛选元素，以确认已成功进入搜索结果页
-            try:
-                await page.wait_for_selector("text=新发布", timeout=15000)
-            except PlaywrightTimeoutError as e:
-                if _is_login_url(page.url):
-                    raise LoginRequiredError(
-                        f"Login required: redirected to {page.url} (cookies/state likely expired)"
-                    ) from e
-                raise
+            # 冷启动路径需要确认筛选栏可见；复用 replay 路径不再依赖页面 DOM。
+            if not replay_confirmed_search_request:
+                try:
+                    await page.wait_for_selector("text=新发布", timeout=15000)
+                except PlaywrightTimeoutError as e:
+                    if _is_login_url(page.url):
+                        raise LoginRequiredError(
+                            f"Login required: redirected to {page.url} (cookies/state likely expired)"
+                        ) from e
+                    raise
 
-            # 模拟真实用户行为：页面加载后的初始停留和浏览
-            log_time("[反爬] 模拟用户查看页面...")
-            await random_sleep(1, 3)
+            if not replay_confirmed_search_request:
+                # 模拟真实用户行为：页面加载后的初始停留和浏览
+                log_time("[反爬] 模拟用户查看页面...")
+                await random_sleep(1, 3)
 
-            # --- 新增：检查是否存在验证弹窗 ---
-            baxia_dialog = page.locator("div.baxia-dialog-mask")
-            middleware_widget = page.locator("div.J_MIDDLEWARE_FRAME_WIDGET")
-            try:
-                # 等待弹窗在2秒内出现。如果出现，则执行块内代码。
-                await baxia_dialog.wait_for(state="visible", timeout=2000)
-                print(
-                    "\n==================== CRITICAL BLOCK DETECTED ===================="
-                )
-                print("检测到闲鱼反爬虫验证弹窗 (baxia-dialog)，无法继续操作。")
-                print("这通常是因为操作过于频繁或被识别为机器人。")
-                print("建议：")
-                print("1. 停止脚本一段时间再试。")
-                print(
-                    "2. (推荐) 在 .env 文件中设置 RUN_HEADLESS=false，以非无头模式运行，这有助于绕过检测。"
-                )
-                print(f"任务 '{keyword}' 将在此处中止。")
-                print(
-                    "==================================================================="
-                )
-                raise RiskControlError("baxia-dialog")
-            except PlaywrightTimeoutError:
-                # 2秒内弹窗未出现，这是正常情况，继续执行
-                pass
+                # --- 新增：检查是否存在验证弹窗 ---
+                baxia_dialog = page.locator("div.baxia-dialog-mask")
+                middleware_widget = page.locator("div.J_MIDDLEWARE_FRAME_WIDGET")
+                try:
+                    # 等待弹窗在2秒内出现。如果出现，则执行块内代码。
+                    await baxia_dialog.wait_for(state="visible", timeout=2000)
+                    print(
+                        "\n==================== CRITICAL BLOCK DETECTED ===================="
+                    )
+                    print("检测到闲鱼反爬虫验证弹窗 (baxia-dialog)，无法继续操作。")
+                    print("这通常是因为操作过于频繁或被识别为机器人。")
+                    print("建议：")
+                    print("1. 停止脚本一段时间再试。")
+                    print(
+                        "2. (推荐) 在 .env 文件中设置 RUN_HEADLESS=false，以非无头模式运行，这有助于绕过检测。"
+                    )
+                    print(f"任务 '{keyword}' 将在此处中止。")
+                    print(
+                        "==================================================================="
+                    )
+                    raise RiskControlError("baxia-dialog")
+                except PlaywrightTimeoutError:
+                    # 2秒内弹窗未出现，这是正常情况，继续执行
+                    pass
 
-            # 检查是否有J_MIDDLEWARE_FRAME_WIDGET覆盖层
-            try:
-                await middleware_widget.wait_for(state="visible", timeout=2000)
-                print(
-                    "\n==================== CRITICAL BLOCK DETECTED ===================="
-                )
-                print(
-                    "检测到闲鱼反爬虫验证弹窗 (J_MIDDLEWARE_FRAME_WIDGET)，无法继续操作。"
-                )
-                print("这通常是因为操作过于频繁或被识别为机器人。")
-                print("建议：")
-                print("1. 停止脚本一段时间再试。")
-                print("2. (推荐) 更新登录状态文件，确保登录状态有效。")
-                print("3. 降低任务执行频率，避免被识别为机器人。")
-                print(f"任务 '{keyword}' 将在此处中止。")
-                print(
-                    "==================================================================="
-                )
-                raise RiskControlError("J_MIDDLEWARE_FRAME_WIDGET")
-            except PlaywrightTimeoutError:
-                # 2秒内弹窗未出现，这是正常情况，继续执行
-                pass
-            # --- 结束新增 ---
+                # 检查是否有J_MIDDLEWARE_FRAME_WIDGET覆盖层
+                try:
+                    await middleware_widget.wait_for(state="visible", timeout=2000)
+                    print(
+                        "\n==================== CRITICAL BLOCK DETECTED ===================="
+                    )
+                    print(
+                        "检测到闲鱼反爬虫验证弹窗 (J_MIDDLEWARE_FRAME_WIDGET)，无法继续操作。"
+                    )
+                    print("这通常是因为操作过于频繁或被识别为机器人。")
+                    print("建议：")
+                    print("1. 停止脚本一段时间再试。")
+                    print("2. (推荐) 更新登录状态文件，确保登录状态有效。")
+                    print("3. 降低任务执行频率，避免被识别为机器人。")
+                    print(f"任务 '{keyword}' 将在此处中止。")
+                    print(
+                        "==================================================================="
+                    )
+                    raise RiskControlError("J_MIDDLEWARE_FRAME_WIDGET")
+                except PlaywrightTimeoutError:
+                    # 2秒内弹窗未出现，这是正常情况，继续执行
+                    pass
+                # --- 结束新增 ---
 
-            try:
-                await page.click("div[class*='closeIconBg']", timeout=3000)
-                print("LOG: 已关闭广告弹窗。")
-            except PlaywrightTimeoutError:
-                print("LOG: 未检测到广告弹窗。")
+                try:
+                    await page.click("div[class*='closeIconBg']", timeout=3000)
+                    print("LOG: 已关闭广告弹窗。")
+                except PlaywrightTimeoutError:
+                    print("LOG: 未检测到广告弹窗。")
 
-            final_response = None
-            new_publish_response = None
-            log_time("步骤 2 - 应用筛选条件...")
-            if new_publish_option:
+            if replay_confirmed_search_request:
+                log_time("步骤 2 - 已复用上轮筛选接口模板，跳过 DOM 筛选。")
+            else:
+                final_response = None
+                new_publish_response = None
+                log_time("步骤 2 - 应用筛选条件...")
+            if new_publish_option and not replay_confirmed_search_request:
                 try:
                     log_time(f"新发布筛选: {new_publish_option}")
                     await _open_new_publish_filter(page)
@@ -1549,7 +1743,7 @@ async def scrape_xianyu(
                     print(f"LOG: 应用新发布筛选失败: {e}")
                     return 0
 
-            if personal_only:
+            if personal_only and not replay_confirmed_search_request:
                 try:
                     async with page.expect_response(
                         is_search_results_response, timeout=20000
@@ -1564,7 +1758,7 @@ async def scrape_xianyu(
                 except Exception as e:
                     print(f"LOG: 应用个人闲置筛选失败: {e}")
 
-            if free_shipping:
+            if free_shipping and not replay_confirmed_search_request:
                 try:
                     async with page.expect_response(
                         is_search_results_response, timeout=20000
@@ -1578,7 +1772,7 @@ async def scrape_xianyu(
                 except Exception as e:
                     print(f"LOG: 应用包邮筛选失败: {e}")
 
-            if region_filter:
+            if region_filter and not replay_confirmed_search_request:
                 try:
                     area_trigger = page.get_by_text("区域", exact=True)
                     if await area_trigger.count():
@@ -1683,7 +1877,7 @@ async def scrape_xianyu(
                 except Exception as e:
                     print(f"LOG: 应用区域筛选 '{region_filter}' 失败: {e}")
 
-            if min_price or max_price:
+            if (min_price or max_price) and not replay_confirmed_search_request:
                 try:
                     price_container = page.locator(
                         'div[class*="search-price-input-container"]'
@@ -1745,6 +1939,26 @@ async def scrape_xianyu(
                     "本轮跳过并关闭复用会话。"
                 )
                 return 0
+            selected_first_page_response = current_response
+            retained_search_request_template = None
+            if requires_filter_response:
+                retained_search_request_template = (
+                    await _build_search_request_template_from_response(
+                        response=selected_first_page_response,
+                        task_config=task_config,
+                        new_publish_option=new_publish_option,
+                    )
+                )
+                if not _search_request_template_is_trusted(
+                    retained_search_request_template,
+                    task_config,
+                ):
+                    close_session_reason = "筛选接口请求模板不可信，关闭复用会话"
+                    log_time(
+                        "筛选接口请求模板缺少当前任务的新发布确认参数，"
+                        "本轮跳过并关闭复用会话。"
+                    )
+                    return 0
             for page_num in range(1, max_pages + 1):
                 if stop_scraping:
                     break
@@ -1851,6 +2065,7 @@ async def scrape_xianyu(
                     browser=browser,
                     context=context,
                     page=page,
+                    search_request_template=retained_search_request_template,
                 )
             attempt_success = True
             close_session_reason = ""
