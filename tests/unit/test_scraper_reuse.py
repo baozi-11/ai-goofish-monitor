@@ -64,9 +64,15 @@ def test_can_reuse_search_session_rejects_filter_changes():
     ) is False
 
 
+class _FakeRequest:
+    def __init__(self, post_data: str = ""):
+        self.post_data = post_data
+
+
 class _FakeResponse:
-    def __init__(self, ok: bool):
+    def __init__(self, ok: bool, post_data: str = ""):
         self.ok = ok
+        self.request = _FakeRequest(post_data)
 
 
 def test_select_search_response_requires_filter_response_when_publish_filter_configured():
@@ -94,10 +100,32 @@ def test_select_search_response_allows_initial_response_without_publish_filter()
     ) is initial_response
 
 
-def test_select_search_response_keeps_publish_confirmation_after_later_filter():
+def test_select_search_response_rejects_later_filter_that_loses_latest_sort():
     initial_response = _FakeResponse(ok=True)
-    publish_response = _FakeResponse(ok=True)
+    publish_response = _FakeResponse(
+        ok=True,
+        post_data='data={"fromFilter":true,"sortValue":"desc","sortField":"create"}',
+    )
     later_filter_response = _FakeResponse(ok=True)
+
+    assert _select_search_response_for_processing(
+        initial_response=initial_response,
+        final_response=later_filter_response,
+        publish_response=publish_response,
+        requires_filter_response=True,
+    ) is None
+
+
+def test_select_search_response_allows_later_filter_that_keeps_latest_sort():
+    initial_response = _FakeResponse(ok=True)
+    publish_response = _FakeResponse(
+        ok=True,
+        post_data='data={"fromFilter":true,"sortValue":"desc","sortField":"create"}',
+    )
+    later_filter_response = _FakeResponse(
+        ok=True,
+        post_data='data={"fromFilter":true,"sortValue":"desc","sortField":"create","extraFilterValue":"{}"}',
+    )
 
     assert _select_search_response_for_processing(
         initial_response=initial_response,

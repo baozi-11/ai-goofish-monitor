@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from playwright.async_api import (
     Error as PlaywrightError,
@@ -191,10 +191,65 @@ def _select_search_response_for_processing(
     ):
         return None
     if final_response and final_response.ok:
+        if requires_filter_response and publish_response is not final_response:
+            if not _response_preserves_publish_sort(final_response, publish_response):
+                log_time(
+                    "搜索响应诊断[selected]: 后续筛选响应未保留新发布排序参数，"
+                    "本轮跳过，避免通知未按新发布范围筛选的商品。"
+                )
+                return None
         return final_response
     if publish_response and getattr(publish_response, "ok", False):
         return publish_response
     return initial_response
+
+
+def _get_response_post_data(response: Optional[Any]) -> str:
+    request = getattr(response, "request", None) if response is not None else None
+    post_data = getattr(request, "post_data", "") if request is not None else ""
+    if callable(post_data):
+        try:
+            post_data = post_data()
+        except Exception:
+            post_data = ""
+    if isinstance(post_data, bytes):
+        return post_data.decode("utf-8", errors="replace")
+    return str(post_data or "")
+
+
+def _decode_search_post_payload(response: Optional[Any]) -> dict:
+    post_data = _get_response_post_data(response).strip()
+    if not post_data:
+        return {}
+    try:
+        if post_data.startswith("{"):
+            return json.loads(post_data)
+        parsed_form = parse_qs(post_data, keep_blank_values=True)
+        data_values = parsed_form.get("data") or []
+        if not data_values:
+            return {}
+        data_value = data_values[0]
+        if isinstance(data_value, str) and data_value.strip().startswith("{"):
+            return json.loads(data_value)
+    except Exception:
+        return {}
+    return {}
+
+
+def _response_preserves_publish_sort(
+    final_response: Optional[Any],
+    publish_response: Optional[Any],
+) -> bool:
+    publish_payload = _decode_search_post_payload(publish_response)
+    final_payload = _decode_search_post_payload(final_response)
+    publish_sort_field = str(publish_payload.get("sortField") or "").strip()
+    publish_sort_value = str(publish_payload.get("sortValue") or "").strip()
+    if not publish_sort_field and not publish_sort_value:
+        return False
+    return (
+        str(final_payload.get("sortField") or "").strip() == publish_sort_field
+        and str(final_payload.get("sortValue") or "").strip() == publish_sort_value
+    )
 
 
 def _search_response_stage_for_log(
